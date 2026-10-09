@@ -1,2 +1,7 @@
 kafka-python
 requests
+pyspark.sql
+pyspark.ml
+numpy
+pandas
+math
