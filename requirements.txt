@@ -1,7 +1,5 @@
 kafka-python
 requests
-pyspark.sql
-pyspark.ml
+pyspark==3.5.3
 numpy
 pandas
-math

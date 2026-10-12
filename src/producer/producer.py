@@ -39,7 +39,7 @@ STATE_FIELDS = (
 
 def _state_to_dict(state: list[Any], fetched_at: int) -> dict[str, Any]:
 	"""Convert OpenSky's positional state vector into a self-describing record."""
-	record = dict(zip(STATE_FIELDS, state, strict=False))
+	record = dict(zip(STATE_FIELDS, state))
 	record["fetched_at"] = fetched_at
 	return record
 

@@ -1,47 +1,39 @@
 import logging
 import os
+from dataclasses import replace
+
 from pyspark.ml import Pipeline
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.feature import StandardScaler, VectorAssembler
 from pyspark.ml.regression import GBTRegressor
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame
 
-from features import compute_features
+from ml.features import AGGREGATED_FEATURE_COLS
+from spark.aggregate import aggregate_for_training
+from spark.config import SparkConfig
+from spark.session import create_spark_session
 
 LOGGER = logging.getLogger(__name__)
 
+FEATURE_COLS = AGGREGATED_FEATURE_COLS
 
-def train() -> None:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+MIN_TRAIN_ROWS = 10
 
-    spark = (
-        SparkSession.builder.appName("OpenSky-ML-BatchTraining")
-        .master(os.getenv("SPARK_MASTER", "local[*]"))
-        .getOrCreate()
-    )
 
-    data_path = os.getenv("TRAIN_DATA_PATH", "./data/historical_opensky")
-    model_output_path = os.getenv("MODEL_OUTPUT_PATH", "./models/delay_gbt_pipeline")
+def fit_and_save(df: DataFrame, model_output_path: str) -> None:
+    """Fit the GBT pipeline on aggregated training rows and overwrite the model path."""
+    row_count = df.count()
+    if row_count < MIN_TRAIN_ROWS:
+        LOGGER.warning(
+            "Skipping retrain: need at least %d aggregated rows, got %d",
+            MIN_TRAIN_ROWS,
+            row_count,
+        )
+        return
 
-    LOGGER.info("Loading training data from %s", data_path)
-    raw_df = spark.read.parquet(data_path)
+    train_df, test_df = df.randomSplit([0.8, 0.2], seed=42)
 
-    # Apply spatial feature extraction
-    featured_df = compute_features(raw_df)
-
-    # Train / Test split
-    train_df, test_df = featured_df.randomSplit([0.8, 0.2], seed=42)
-
-    # ML Pipeline Stages
-    feature_cols = [
-        "dist_to_airport_km",
-        "clean_altitude",
-        "clean_velocity",
-        "clean_vertical_rate",
-        "descent_gradient",
-    ]
-
-    assembler = VectorAssembler(inputCols=feature_cols, outputCol="raw_features")
+    assembler = VectorAssembler(inputCols=FEATURE_COLS, outputCol="raw_features")
     scaler = StandardScaler(inputCol="raw_features", outputCol="features")
     gbt = GBTRegressor(
         featuresCol="features",
@@ -53,11 +45,14 @@ def train() -> None:
 
     pipeline = Pipeline(stages=[assembler, scaler, gbt])
 
-    LOGGER.info("Fitting GBT Regression model...")
+    LOGGER.info("Fitting GBT Regression model on %d aggregated rows...", row_count)
     model_pipeline = pipeline.fit(train_df)
 
-    # Evaluation
-    predictions = model_pipeline.transform(test_df)
+    eval_df = test_df if not test_df.isEmpty() else train_df
+    if test_df.isEmpty():
+        LOGGER.warning("Test split empty; reporting metrics on train split instead")
+
+    predictions = model_pipeline.transform(eval_df)
     evaluator_rmse = RegressionEvaluator(
         labelCol="actual_delay_min", predictionCol="prediction", metricName="rmse"
     )
@@ -68,10 +63,31 @@ def train() -> None:
     rmse = evaluator_rmse.evaluate(predictions)
     mae = evaluator_mae.evaluate(predictions)
 
-    LOGGER.info("Model Evaluation -> Test RMSE: %.3f min, Test MAE: %.3f min", rmse, mae)
+    LOGGER.info("Model Evaluation -> RMSE: %.3f min, MAE: %.3f min", rmse, mae)
 
     LOGGER.info("Saving fitted model pipeline to %s", model_output_path)
     model_pipeline.write().overwrite().save(model_output_path)
+
+
+def train() -> None:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    # Offline / local default differs from the compose cluster default.
+    config = SparkConfig.from_env()
+    if os.getenv("SPARK_MASTER") is None:
+        config = replace(config, master="local[*]", driver_host=None)
+
+    spark = create_spark_session(
+        "OpenSky-ML-BatchTraining",
+        enable_kafka=False,
+        config=config,
+    )
+
+    LOGGER.info("Loading training data from %s", config.train_data_path)
+    raw_df = spark.read.parquet(config.train_data_path)
+
+    LOGGER.info("Aggregating per-aircraft features for training")
+    training_df = aggregate_for_training(raw_df)
+    fit_and_save(training_df, config.model_output_path)
     spark.stop()
 
 
