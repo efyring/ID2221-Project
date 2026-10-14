@@ -42,13 +42,13 @@ class SparkConfig:
             ),
             kafka_topic=os.getenv("KAFKA_TOPIC", "opensky-states"),
             train_data_path=os.getenv(
-                "TRAIN_DATA_PATH", "./data/historical_opensky"
+                "TRAIN_DATA_PATH", "hdfs://namenode:8020/data/historical_opensky"
             ),
             model_output_path=os.getenv(
-                "MODEL_OUTPUT_PATH", "./models/delay_gbt_pipeline"
+                "MODEL_OUTPUT_PATH", "hdfs://namenode:8020/models/delay_gbt_pipeline"
             ),
             checkpoint_path=os.getenv(
-                "CHECKPOINT_PATH", "./data/checkpoints/opensky_kafka"
+                "CHECKPOINT_PATH", "hdfs://namenode:8020/checkpoints/opensky_kafka"
             ),
             retrain_every_n_batches=int(os.getenv("RETRAIN_EVERY_N_BATCHES", "10")),
             ivy_path=os.getenv("IVY_HOME", "/opt/bitnami/spark/.ivy2"),
@@ -59,6 +59,7 @@ class SparkConfig:
         configs: dict[str, str] = {
             "spark.sql.shuffle.partitions": self.shuffle_partitions,
             "spark.driver.bindAddress": self.driver_bind_address,
+            "spark.hadoop.fs.defaultFS": "hdfs://namenode:8020",
             # Absolute ivy path — Bitnami user 1001 often has no usable $HOME.
             "spark.jars.ivy": self.ivy_path,
         }

@@ -50,27 +50,52 @@ services:
           --replication-factor 1
     restart: "no"
 
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: id2221-namenode
+    environment:
+      - CLUSTER_NAME=test
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+    ports:
+      - "9870:9870"
+      - "8020:8020"
+    volumes:
+      - hdfs_namenode:/hadoop/dfs/name
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: id2221-datanode
+    depends_on:
+      - namenode
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+    volumes:
+      - hdfs_datanode:/hadoop/dfs/data
+
   spark-master:
     build:
       context: .
       dockerfile: docker/spark/Dockerfile
     container_name: id2221-spark-master
+    depends_on:
+      - namenode
+      - datanode
     environment:
       SPARK_MODE: master
       # Advertise a stable DNS name (not the ephemeral container id).
       SPARK_MASTER_HOST: spark-master
-      TRAIN_DATA_PATH: /data/historical_opensky
-      MODEL_OUTPUT_PATH: /models/delay_gbt_pipeline
+      TRAIN_DATA_PATH: hdfs://namenode:8020/data/historical_opensky
+      MODEL_OUTPUT_PATH: hdfs://namenode:8020/models/delay_gbt_pipeline
+      CHECKPOINT_PATH: hdfs://namenode:8020/checkpoints/opensky_kafka
       PYTHONPATH: /opt/bitnami/spark/python:/opt/project/src
       HOME: /opt/bitnami/spark
       USER: spark
-      HADOOP_USER_NAME: spark
+      HADOOP_USER_NAME: root
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
     ports:
       - "8080:8080"
       - "7077:7077"
     volumes:
-      - ./data:/data
-      - ./models:/models
       - ./src:/opt/project/src:ro
 
   spark-worker:
@@ -80,6 +105,8 @@ services:
     container_name: id2221-spark-worker
     depends_on:
       - spark-master
+      - namenode
+      - datanode
     environment:
       SPARK_MODE: worker
       SPARK_MASTER_URL: spark://spark-master:7077
@@ -87,10 +114,9 @@ services:
       SPARK_WORKER_CORES: 2
       HOME: /opt/bitnami/spark
       USER: spark
-      HADOOP_USER_NAME: spark
+      HADOOP_USER_NAME: root
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
     volumes:
-      - ./data:/data
-      - ./models:/models
       - ./src:/opt/project/src:ro
 
   ingest:
@@ -103,14 +129,18 @@ services:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
+      namenode:
+        condition: service_started
+      datanode:
+        condition: service_started
     environment:
       # local[*] avoids depending on worker registration for streaming writes.
       SPARK_MASTER: "local[*]"
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: opensky-states
-      TRAIN_DATA_PATH: /data/historical_opensky
-      MODEL_OUTPUT_PATH: /models/delay_gbt_pipeline
-      CHECKPOINT_PATH: /data/checkpoints/opensky_kafka
+      TRAIN_DATA_PATH: hdfs://namenode:8020/data/historical_opensky
+      MODEL_OUTPUT_PATH: hdfs://namenode:8020/models/delay_gbt_pipeline
+      CHECKPOINT_PATH: hdfs://namenode:8020/checkpoints/opensky_kafka
       RETRAIN_EVERY_N_BATCHES: "1"
       LOG_LEVEL: INFO
       PYTHONPATH: /opt/bitnami/spark/python:/opt/project/src
@@ -118,10 +148,9 @@ services:
       IVY_HOME: /opt/bitnami/spark/.ivy2
       HOME: /opt/bitnami/spark
       USER: spark
-      HADOOP_USER_NAME: spark
+      HADOOP_USER_NAME: root
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
     volumes:
-      - ./data:/data
-      - ./models:/models
       - ./src:/opt/project/src:ro
     entrypoint: ["/opt/bitnami/spark/venv/bin/python"]
     command: ["/opt/project/src/spark/ingest.py"]
@@ -129,3 +158,5 @@ services:
 
 volumes:
   kafka_data:
+  hdfs_namenode:
+  hdfs_datanode:
