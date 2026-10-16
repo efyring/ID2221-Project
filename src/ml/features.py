@@ -1,5 +1,4 @@
-import math
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     ArrayType,
@@ -12,7 +11,6 @@ from pyspark.sql.types import (
     StructType,
 )
 
-# Exact schema matching producer.py STATE_FIELDS + fetched_at
 OPENSKY_SCHEMA = StructType([
     StructField("icao24", StringType(), True),
     StructField("callsign", StringType(), True),
@@ -26,7 +24,6 @@ OPENSKY_SCHEMA = StructType([
     StructField("velocity", DoubleType(), True),
     StructField("true_track", DoubleType(), True),
     StructField("vertical_rate", DoubleType(), True),
-    # OpenSky sends an int array (or null), not a string.
     StructField("sensors", ArrayType(IntegerType()), True),
     StructField("geo_altitude", DoubleType(), True),
     StructField("squawk", StringType(), True),
@@ -36,124 +33,76 @@ OPENSKY_SCHEMA = StructType([
     StructField("fetched_at", LongType(), True),
 ])
 
-# Stockholm Arlanda Airport (ARN) Coordinates
-ARN_LAT = 59.6519
-ARN_LON = 17.9186
+LABEL_COL = "remaining_min"
 
-# Pre-compute static radian values in Python to avoid PySpark Column conversion errors
-ARN_LAT_RAD = math.radians(ARN_LAT)
-COS_ARN_LAT = math.cos(ARN_LAT_RAD)
-
-
-def compute_features(df: DataFrame) -> DataFrame:
-    """Filter airborne state vectors and compute spatial/kinematic features."""
-    # Filter out grounded aircraft or records missing positional telemetry
-    filtered_df = df.filter(
-        (F.col("on_ground") == False)
-        & F.col("latitude").isNotNull()
-        & F.col("longitude").isNotNull()
-    )
-
-    # Haversine distance formula to target airport (in kilometers)
-    dlat = F.radians(F.col("latitude") - ARN_LAT)
-    dlon = F.radians(F.col("longitude") - ARN_LON)
-    a = (
-        F.sin(dlat / 2) ** 2
-        + F.lit(COS_ARN_LAT)
-        * F.cos(F.radians(F.col("latitude")))
-        * F.sin(dlon / 2) ** 2
-    )
-    c = 2 * F.atan2(F.sqrt(a), F.sqrt(1 - a))
-    dist_km = 6371.0 * c
-
-    # Handle null kinematic values with defaults
-    altitude = F.coalesce(F.col("baro_altitude"), F.lit(0.0))
-    velocity = F.coalesce(F.col("velocity"), F.lit(0.0))
-    v_rate = F.coalesce(F.col("vertical_rate"), F.lit(0.0))
-
-    # Derived physical indicators
-    descent_gradient = altitude / (dist_km + 1e-5)
-
-    return (
-        filtered_df.withColumn("dist_to_airport_km", dist_km)
-        .withColumn("clean_altitude", altitude)
-        .withColumn("clean_velocity", velocity)
-        .withColumn("clean_vertical_rate", v_rate)
-        .withColumn("descent_gradient", descent_gradient)
-    )
-
-
-def add_proxy_label(df: DataFrame) -> DataFrame:
-    """Add a kinematics-based proxy delay label for continuous-learning demos.
-
-    This is not schedule ground truth. It synthesizes ``actual_delay_min`` from
-    distance, speed, altitude, and vertical rate so the GBT pipeline can train
-    without joining flight schedules.
-    """
-    # Floor speed so ETA stays finite for near-hovering tracks
-    speed_km_h = F.greatest(F.col("clean_velocity") * 3.6, F.lit(50.0))
-    eta_min = (F.col("dist_to_airport_km") / speed_km_h) * 60.0
-    altitude_term = F.col("clean_altitude") / 300.0
-    climb_term = F.when(
-        F.col("clean_vertical_rate") > 0,
-        F.col("clean_vertical_rate") * 0.1,
-    ).otherwise(F.lit(0.0))
-    proxy = F.greatest(
-        F.lit(0.0),
-        eta_min * 0.15 + altitude_term * 0.05 + climb_term,
-    )
-    return df.withColumn("actual_delay_min", proxy)
-
-
-# Columns produced by ``aggregate_training_features`` (excluding the label).
-AGGREGATED_FEATURE_COLS = [
-    "n_samples",
-    "avg_dist_to_airport_km",
-    "min_dist_to_airport_km",
-    "max_dist_to_airport_km",
-    "avg_altitude",
-    "std_altitude",
-    "avg_velocity",
-    "std_velocity",
-    "avg_vertical_rate",
-    "avg_descent_gradient",
-    "min_descent_gradient",
+FEATURE_COLS = [
+    "dist_to_arr_km",
+    "naive_eta_min",
+    "altitude",
+    "velocity",
+    "vertical_rate",
+    "hour_utc",
+    "day_of_week",
 ]
 
 
-def aggregate_training_features(df: DataFrame) -> DataFrame:
-    """Collapse per-snapshot rows into one aggregated training row per aircraft.
+def load_airports(spark: SparkSession, path: str) -> DataFrame:
+    """Read the airport lookup CSV (columns: icao, lat, lon)."""
+    return spark.read.csv(path, header=True, inferSchema=True).select("icao", "lat", "lon")
 
-    Groups by ``icao24`` and computes mean/min/max/stddev track statistics that
-    the GBT model uses as features. The label is the mean proxy delay over the
-    track. Stddev columns are filled with 0 when a track has a single sample.
-    """
-    aggregated = (
-        df.groupBy("icao24")
-        .agg(
-            F.count(F.lit(1)).alias("n_samples"),
-            F.avg("dist_to_airport_km").alias("avg_dist_to_airport_km"),
-            F.min("dist_to_airport_km").alias("min_dist_to_airport_km"),
-            F.max("dist_to_airport_km").alias("max_dist_to_airport_km"),
-            F.avg("clean_altitude").alias("avg_altitude"),
-            F.stddev_samp("clean_altitude").alias("std_altitude"),
-            F.avg("clean_velocity").alias("avg_velocity"),
-            F.stddev_samp("clean_velocity").alias("std_velocity"),
-            F.avg("clean_vertical_rate").alias("avg_vertical_rate"),
-            F.avg("descent_gradient").alias("avg_descent_gradient"),
-            F.min("descent_gradient").alias("min_descent_gradient"),
-            F.avg("actual_delay_min").alias("actual_delay_min"),
-        )
-        .na.fill(0.0, ["std_altitude", "std_velocity"])
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    dlat = F.radians(lat2 - lat1)
+    dlon = F.radians(lon2 - lon1)
+    a = (
+        F.sin(dlat / 2) ** 2
+        + F.cos(F.radians(lat1)) * F.cos(F.radians(lat2)) * F.sin(dlon / 2) ** 2
     )
-    return aggregated.filter(F.col("n_samples") >= 1)
+    return 2 * 6371.0 * F.asin(F.sqrt(F.least(F.lit(1.0), a)))
 
 
-def prepare_training_dataset(df: DataFrame) -> DataFrame:
-    """Featureize (if needed), label (if needed), then aggregate for training."""
-    working = df
-    if "dist_to_airport_km" not in working.columns:
-        working = compute_features(working)
-    if "actual_delay_min" not in working.columns:
-        working = add_proxy_label(working)
-    return aggregate_training_features(working)
+def add_features(df: DataFrame, airports: DataFrame) -> DataFrame:
+    """Add model features. Rows with unknown arrival airport or no position are dropped."""
+    out = df.filter(
+        F.col("latitude").isNotNull()
+        & F.col("longitude").isNotNull()
+        & F.col("ts").isNotNull()
+    )
+    if "on_ground" in df.columns:
+        out = out.filter(~F.coalesce(F.col("on_ground"), F.lit(False)))
+
+    arr = airports.select(
+        F.col("icao").alias("arr_airport"),
+        F.col("lat").alias("arr_lat"),
+        F.col("lon").alias("arr_lon"),
+    )
+    out = out.join(F.broadcast(arr), "arr_airport")
+
+    velocity = F.coalesce(F.col("velocity"), F.lit(0.0))
+    speed_kmh = F.greatest(velocity * 3.6, F.lit(50.0))  # floor keeps ETA finite
+    dist_to_arr = _haversine_km(F.col("latitude"), F.col("longitude"), F.col("arr_lat"), F.col("arr_lon"))
+    ts = F.timestamp_seconds("ts")
+
+    return (
+        out.withColumn("dist_to_arr_km", dist_to_arr)
+        # Simple physics baseline: distance left / current ground speed.
+        .withColumn("naive_eta_min", F.col("dist_to_arr_km") / speed_kmh * 60.0)
+        .withColumn("altitude", F.coalesce(F.col("baro_altitude"), F.lit(0.0)))
+        .withColumn("velocity", velocity)
+        .withColumn("vertical_rate", F.coalesce(F.col("vertical_rate"), F.lit(0.0)))
+        .withColumn("hour_utc", F.hour(ts).cast("double"))
+        .withColumn("day_of_week", F.dayofweek(ts).cast("double"))
+    )
+
+
+def add_label(df: DataFrame) -> DataFrame:
+    """Add ``remaining_min`` (training label) and ``flight_key`` (for leak-free splits)."""
+    return (
+        df.filter(F.col("actual_arrival_ts").isNotNull())
+        .withColumn(LABEL_COL, (F.col("actual_arrival_ts") - F.col("ts")) / 60.0)
+        .filter((F.col(LABEL_COL) >= 0) & (F.col(LABEL_COL) <= 24 * 60))
+        .withColumn(
+            "flight_key",
+            F.concat_ws("_", F.col("icao24"), F.col("actual_arrival_ts").cast("string")),
+        )
+    )

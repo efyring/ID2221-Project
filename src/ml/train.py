@@ -1,93 +1,76 @@
+"""Train a GBT regressor that predicts minutes remaining until landing."""
+
 import logging
 import os
 from dataclasses import replace
 
 from pyspark.ml import Pipeline
 from pyspark.ml.evaluation import RegressionEvaluator
-from pyspark.ml.feature import StandardScaler, VectorAssembler
+from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.regression import GBTRegressor
 from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
-from ml.features import AGGREGATED_FEATURE_COLS
-from spark.aggregate import aggregate_for_training
+from ml.features import FEATURE_COLS, LABEL_COL, add_features, add_label, load_airports
 from spark.config import SparkConfig
 from spark.session import create_spark_session
 
 LOGGER = logging.getLogger(__name__)
 
-FEATURE_COLS = AGGREGATED_FEATURE_COLS
+MIN_TRAIN_ROWS = 100
 
-MIN_TRAIN_ROWS = 10
+
+def offline_config() -> SparkConfig:
+    """Config for train/predict scripts: local[*] unless SPARK_MASTER is set."""
+    config = SparkConfig.from_env()
+    if os.getenv("SPARK_MASTER") is None:
+        config = replace(config, master="local[*]", driver_host=None)
+    return config
 
 
 def fit_and_save(df: DataFrame, model_output_path: str) -> None:
-    """Fit the GBT pipeline on aggregated training rows and overwrite the model path."""
+    """Fit on a featurized + labelled DataFrame, report metrics, save the model."""
+    df = df.cache()
     row_count = df.count()
     if row_count < MIN_TRAIN_ROWS:
-        LOGGER.warning(
-            "Skipping retrain: need at least %d aggregated rows, got %d",
-            MIN_TRAIN_ROWS,
-            row_count,
-        )
+        LOGGER.warning("Need at least %d rows, got %d. Skipping.", MIN_TRAIN_ROWS, row_count)
         return
 
-    train_df, test_df = df.randomSplit([0.8, 0.2], seed=42)
+    # Split by flight (not by row) so snapshots of one flight never leak into the test set.
+    bucket = F.pmod(F.hash("flight_key"), F.lit(5))
+    train_df = df.filter(bucket != 0)
+    test_df = df.filter(bucket == 0)
 
-    assembler = VectorAssembler(inputCols=FEATURE_COLS, outputCol="raw_features")
-    scaler = StandardScaler(inputCol="raw_features", outputCol="features")
-    gbt = GBTRegressor(
-        featuresCol="features",
-        labelCol="actual_delay_min",
-        maxDepth=5,
-        maxIter=30,
-        seed=42,
-    )
+    pipeline = Pipeline(stages=[
+        VectorAssembler(inputCols=FEATURE_COLS, outputCol="features", handleInvalid="skip"),
+        GBTRegressor(featuresCol="features", labelCol=LABEL_COL, maxDepth=6, maxIter=50, seed=42),
+    ])
 
-    pipeline = Pipeline(stages=[assembler, scaler, gbt])
+    LOGGER.info("Fitting on %d rows", row_count)
+    model = pipeline.fit(train_df)
 
-    LOGGER.info("Fitting GBT Regression model on %d aggregated rows...", row_count)
-    model_pipeline = pipeline.fit(train_df)
+    preds = model.transform(test_df)
+    for metric in ("rmse", "mae"):
+        ev = RegressionEvaluator(labelCol=LABEL_COL, predictionCol="prediction", metricName=metric)
+        base = RegressionEvaluator(labelCol=LABEL_COL, predictionCol="naive_eta_min", metricName=metric)
+        LOGGER.info(
+            "Test %s: model %.2f min | baseline (distance/speed) %.2f min",
+            metric.upper(), ev.evaluate(preds), base.evaluate(preds),
+        )
 
-    eval_df = test_df if not test_df.isEmpty() else train_df
-    if test_df.isEmpty():
-        LOGGER.warning("Test split empty; reporting metrics on train split instead")
-
-    predictions = model_pipeline.transform(eval_df)
-    evaluator_rmse = RegressionEvaluator(
-        labelCol="actual_delay_min", predictionCol="prediction", metricName="rmse"
-    )
-    evaluator_mae = RegressionEvaluator(
-        labelCol="actual_delay_min", predictionCol="prediction", metricName="mae"
-    )
-
-    rmse = evaluator_rmse.evaluate(predictions)
-    mae = evaluator_mae.evaluate(predictions)
-
-    LOGGER.info("Model Evaluation -> RMSE: %.3f min, MAE: %.3f min", rmse, mae)
-
-    LOGGER.info("Saving fitted model pipeline to %s", model_output_path)
-    model_pipeline.write().overwrite().save(model_output_path)
+    model.write().overwrite().save(model_output_path)
+    LOGGER.info("Saved model to %s", model_output_path)
 
 
 def train() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-    # Offline / local default differs from the compose cluster default.
-    config = SparkConfig.from_env()
-    if os.getenv("SPARK_MASTER") is None:
-        config = replace(config, master="local[*]", driver_host=None)
+    config = offline_config()
+    spark = create_spark_session("OpenSky-ETA-Training", config=config)
 
-    spark = create_spark_session(
-        "OpenSky-ML-BatchTraining",
-        enable_kafka=False,
-        config=config,
-    )
-
-    LOGGER.info("Loading training data from %s", config.train_data_path)
-    raw_df = spark.read.parquet(config.train_data_path)
-
-    LOGGER.info("Aggregating per-aircraft features for training")
-    training_df = aggregate_for_training(raw_df)
-    fit_and_save(training_df, config.model_output_path)
+    airports = load_airports(spark, config.airports_path)
+    raw = spark.read.parquet(config.train_data_path)
+    data = add_label(add_features(raw, airports))
+    fit_and_save(data, config.model_output_path)
     spark.stop()
 
 

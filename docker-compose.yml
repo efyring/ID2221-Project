@@ -85,8 +85,9 @@ services:
       # Advertise a stable DNS name (not the ephemeral container id).
       SPARK_MASTER_HOST: spark-master
       TRAIN_DATA_PATH: hdfs://namenode:8020/data/historical_opensky
-      MODEL_OUTPUT_PATH: hdfs://namenode:8020/models/delay_gbt_pipeline
+      MODEL_OUTPUT_PATH: hdfs://namenode:8020/models/eta_gbt_pipeline
       CHECKPOINT_PATH: hdfs://namenode:8020/checkpoints/opensky_kafka
+      AIRPORTS_PATH: hdfs://namenode:8020/data/airports.csv
       PYTHONPATH: /opt/bitnami/spark/python:/opt/project/src
       HOME: /opt/bitnami/spark
       USER: spark
@@ -139,9 +140,8 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: opensky-states
       TRAIN_DATA_PATH: hdfs://namenode:8020/data/historical_opensky
-      MODEL_OUTPUT_PATH: hdfs://namenode:8020/models/delay_gbt_pipeline
+      MODEL_OUTPUT_PATH: hdfs://namenode:8020/models/eta_gbt_pipeline
       CHECKPOINT_PATH: hdfs://namenode:8020/checkpoints/opensky_kafka
-      RETRAIN_EVERY_N_BATCHES: "1"
       LOG_LEVEL: INFO
       PYTHONPATH: /opt/bitnami/spark/python:/opt/project/src
       SPARK_HOME: /opt/bitnami/spark

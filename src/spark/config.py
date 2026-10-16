@@ -8,7 +8,6 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SparkConfig:
-    """Resolved Spark settings used by session builders and streaming jobs."""
 
     master: str
     version: str
@@ -21,7 +20,7 @@ class SparkConfig:
     train_data_path: str
     model_output_path: str
     checkpoint_path: str
-    retrain_every_n_batches: int
+    airports_path: str
     ivy_path: str
 
     @property
@@ -37,20 +36,20 @@ class SparkConfig:
             driver_bind_address=os.getenv("SPARK_DRIVER_BIND_ADDRESS", "0.0.0.0"),
             shuffle_partitions=os.getenv("SPARK_SQL_SHUFFLE_PARTITIONS", "4"),
             log_level=os.getenv("SPARK_LOG_LEVEL", "WARN"),
-            kafka_bootstrap_servers=os.getenv(
-                "KAFKA_BOOTSTRAP_SERVERS", "kafka:29092"
-            ),
+            kafka_bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092"),
             kafka_topic=os.getenv("KAFKA_TOPIC", "opensky-states"),
             train_data_path=os.getenv(
                 "TRAIN_DATA_PATH", "hdfs://namenode:8020/data/historical_opensky"
             ),
             model_output_path=os.getenv(
-                "MODEL_OUTPUT_PATH", "hdfs://namenode:8020/models/delay_gbt_pipeline"
+                "MODEL_OUTPUT_PATH", "hdfs://namenode:8020/models/eta_gbt_pipeline"
             ),
             checkpoint_path=os.getenv(
                 "CHECKPOINT_PATH", "hdfs://namenode:8020/checkpoints/opensky_kafka"
             ),
-            retrain_every_n_batches=int(os.getenv("RETRAIN_EVERY_N_BATCHES", "10")),
+            airports_path=os.getenv(
+                "AIRPORTS_PATH", "hdfs://namenode:8020/data/airports.csv"
+            ),
             ivy_path=os.getenv("IVY_HOME", "/opt/bitnami/spark/.ivy2"),
         )
 
@@ -60,6 +59,8 @@ class SparkConfig:
             "spark.sql.shuffle.partitions": self.shuffle_partitions,
             "spark.driver.bindAddress": self.driver_bind_address,
             "spark.hadoop.fs.defaultFS": "hdfs://namenode:8020",
+            # Hour/day-of-week features are computed in UTC.
+            "spark.sql.session.timeZone": "UTC",
             # Absolute ivy path — Bitnami user 1001 often has no usable $HOME.
             "spark.jars.ivy": self.ivy_path,
         }
