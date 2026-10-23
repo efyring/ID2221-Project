@@ -21,10 +21,11 @@ MIN_TRAIN_ROWS = 100
 
 
 def offline_config() -> SparkConfig:
-    """Config for train/predict scripts: local[*] unless SPARK_MASTER is set."""
     config = SparkConfig.from_env()
     if os.getenv("SPARK_MASTER") is None:
         config = replace(config, master="local[*]", driver_host=None)
+        if os.getenv("DEFAULT_FS") is None:
+            config = replace(config, default_fs="file:///")
     return config
 
 

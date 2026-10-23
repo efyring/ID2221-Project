@@ -13,23 +13,38 @@ from spark.session import create_spark_session
 
 LOGGER = logging.getLogger(__name__)
 
+# Time zone of the arrival airport (Frankfurt). Spark itself runs in UTC.
+DISPLAY_TZ = os.getenv("DISPLAY_TZ", "Europe/Berlin")
+
 
 def predict(model: PipelineModel, df: DataFrame, airports: DataFrame) -> DataFrame:
-    """Score flights. If ``ts`` is missing, ``fetched_at`` is used.
+    """Score flights. Input needs the columns described in ml/features.py
+    (``actual_arrival_ts`` is not needed). If ``ts`` is missing, ``fetched_at`` is used.
     """
     if "ts" not in df.columns:
         df = df.withColumn("ts", F.col("fetched_at"))
 
     scored = model.transform(add_features(df, airports))
-    return (
+    scored = (
         scored.withColumn("pred_remaining_min", F.greatest(F.col("prediction"), F.lit(0.0)))
         .withColumn("pred_landing_ts", (F.col("ts") + F.col("pred_remaining_min") * 60).cast("long"))
-        .withColumn("pred_landing_time", F.timestamp_seconds("pred_landing_ts"))
-        .select(
-            "icao24", "arr_airport", "ts",
-            "pred_remaining_min", "pred_landing_ts", "pred_landing_time",
-        )
+        .withColumn("pred_landing_time", F.timestamp_seconds("pred_landing_ts"))  # UTC instant
+        # Wall-clock time at the arrival airport, for display only
+        .withColumn("pred_landing_local", F.from_utc_timestamp("pred_landing_time", DISPLAY_TZ))
     )
+    cols = [
+        "icao24", "arr_airport", "ts",
+        "dist_to_arr_km", "altitude", "velocity", "vertical_rate",
+        "pred_remaining_min", "pred_landing_ts", "pred_landing_time", "pred_landing_local",
+    ]
+    if "callsign" in scored.columns:  # live OpenSky states have it
+        cols.insert(1, "callsign")
+    if "true_arrival_ts" in scored.columns:  # only present in the synthetic demo data
+        scored = scored.withColumn(
+            "err_min", (F.col("pred_landing_ts") - F.col("true_arrival_ts")) / 60.0
+        )
+        cols += ["true_arrival_ts", "err_min"]
+    return scored.select(*cols)
 
 
 def main() -> None:
@@ -47,6 +62,8 @@ def main() -> None:
         result.write.mode("overwrite").parquet(output_path)
     else:
         result.show(20, truncate=False)
+        if "err_min" in result.columns:
+            result.agg(F.avg(F.abs("err_min")).alias("MAE_min")).show()
     spark.stop()
 
 

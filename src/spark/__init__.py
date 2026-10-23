@@ -1,8 +1,8 @@
-"""Spark runtime: config, session factory, aggregations, and Kafka ingest."""
+"""Spark runtime: config, session factory, and Kafka ingest."""
 
 from spark.config import SparkConfig
 
-__all__ = ["SparkConfig", "aggregate_for_training", "create_spark_session"]
+__all__ = ["SparkConfig", "create_spark_session"]
 
 
 def __getattr__(name: str):
@@ -10,8 +10,4 @@ def __getattr__(name: str):
         from spark.session import create_spark_session
 
         return create_spark_session
-    if name == "aggregate_for_training":
-        from spark.aggregate import aggregate_for_training
-
-        return aggregate_for_training
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

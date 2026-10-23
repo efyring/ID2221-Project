@@ -1,149 +1,122 @@
 # ID2221-Project
 
-Kafka + Spark continuous-learning stack for OpenSky aircraft states: a host-side
-producer publishes to Kafka; a Spark Structured Streaming job appends Parquet and
-periodically retrains a GBT delay model (proxy label).
+Kafka + Spark stack for OpenSky aircraft states, combined with a Gradient Boosted Trees (GBT) model that predicts remaining flight time and landing times at an airport (default: Frankfurt, **EDDF**; change via `ARRIVAL_AIRPORT`).
 
-## Quick start (compose-first)
+---
 
-1. Start Kafka, Spark master/worker, topic init, and the ingest job:
+## Quick Start
 
-```bash
-docker compose up -d --build
-```
-
-2. On the host, install producer deps and publish OpenSky states to `localhost:9092`:
+### 1. Try End-to-End on Synthetic Data (No Docker Needed)
+Requires Java 17/21 and Python:
 
 ```bash
-python -m pip install -r requirements.txt
-python src/producer/producer.py
+pip install -r requirements.txt
+make demo # Runs: make data, make train, make predict
 ```
 
-3. Observe:
+* **`make data`**: Writes synthetic history (`data/synthetic/historical_opensky/`, ~3,000 flights, 500k snapshots) and current flight snapshots (`data/synthetic/current_flights/`, 200 unseen mid-flight snapshots).
+* **`make train`**: Fits the GBT model on the synthetic folder, saves it to `models/eta_gbt_pipeline`, and logs test RMSE/MAE against a naive distance/speed baseline.
+* **`make predict`**: Predicts landing times for `data/synthetic/current_flights`, printing `err_min` per flight and overall MAE.
+* **`make stream`**: Real-time prediction from Kafka.
 
-- Spark master UI: [http://localhost:8080](http://localhost:8080)
-- Growing training data: `./data/historical_opensky/fetched_at_date=YYYY-MM-DD/`
-- Checkpoints: `./data/checkpoints/opensky_kafka`
-- Retrained model (every 10 micro-batches by default): `./models/delay_gbt_pipeline`
+> **Note:** Synthetic data lives in `data/synthetic/` (wiped and rewritten on each `make data`), keeping it separate from real ingested data in `data/historical_opensky/`. Replace with real history once available.
 
-Stop while keeping Kafka broker volume data:
+### 2. Live Docker Stack
+1. Start infrastructure and ingest stream:
+   ```bash
+   docker compose up -d --build
+   ```
+2. On the host, install producer dependencies and publish states:
+   ```bash
+   python -m pip install -r requirements.txt
+   python src/producer/producer.py
+   ```
+3. **Monitor**:
+   * Spark Master UI: [http://localhost:8080](http://localhost:8080)
+   * Ingested Parquet data: `./data/historical_opensky/fetched_at_date=YYYY-MM-DD/`
 
-```bash
-docker compose down
-```
+---
 
-Remove the Kafka volume as well:
-
-```bash
-docker compose down -v
-```
-
-## Architecture
+## Architecture & Data Flow
 
 | Component | Where it runs | Role |
 |-----------|---------------|------|
-| `kafka` | Docker | Dual listeners: host `localhost:9092`, in-compose `kafka:29092` |
-| `kafka-init` | Docker (one-shot) | Creates `opensky-states` if missing |
-| `spark-master` / `spark-worker` | Docker | Spark cluster (`7077` / UI `8080`) |
-| `ingest` | Docker | `src/spark/ingest.py` — Kafka → features → Parquet → periodic retrain |
+| `kafka` / `kafka-init` | Docker | Message broker & topic initializer (`opensky-states`) |
+| `spark-master` / `spark-worker` | Docker | Distributed compute cluster (`7077` / UI `8080`) |
+| `ingest` | Docker | `src/spark/ingest.py` — Kafka → Parquet storage & periodic model training |
 | `producer.py` | Host | Polls OpenSky HTTP API → Kafka |
+| `predict_stream.py` | Host/Local | Real-time Kafka consumer → inbound filter → ETA predictions |
 
 ```text
-OpenSky API → producer (host) → Kafka → ingest (Spark) → ./data + ./models
+LIVE: OpenSky API → producer (host) → Kafka → predict_stream.py → predicted landing times
+TRAIN: historical flights (arrival airport + landing time) → train.py → model
 ```
 
-## Producer
+---
 
-Polls OpenSky Network `GET /states/all` and publishes one JSON message per
-aircraft (`icao24` key) to `opensky-states`.
+## Data Requirements
 
+* **Training Data**: Parquet at `TRAIN_DATA_PATH`, one row per position snapshot:
+  * `icao24` (string): Aircraft ID
+  * `arr_airport` (string): ICAO code of landing airport
+  * `ts` (long): Snapshot time, Unix seconds UTC
+  * `latitude`, `longitude` (double)
+  * `baro_altitude`, `velocity`, `vertical_rate` (double; nulls filled with 0)
+  * `actual_arrival_ts` (long): Actual landing timestamp
+  * `on_ground` (boolean): Optional; grounded rows are dropped.
+* **Airports CSV**: Located at `AIRPORTS_PATH` with header `icao,lat,lon`. (Departure airport is not needed).
+* **Label & Features**: 
+  * Label: `remaining_min = (actual_arrival_ts - ts) / 60`
+  * Features: Distance to arrival airport, naive ETA (distance / speed), altitude, speed, vertical rate, UTC hour, weekday.
+
+---
+
+## Real-Time Predictions & Cassandra Storage
+
+### Running the Stream
+Start Kafka and the producer, then run the streaming predictor:
 ```bash
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
-KAFKA_TOPIC=opensky-states \
-POLL_INTERVAL_SECONDS=15 \
-python src/producer/producer.py
+python src/producer/producer.py # Terminal 1
+make stream                     # Terminal 2: predictions every 15s
 ```
 
-Use `RUN_ONCE=true` for a single fetch. Keep the poll interval conservative;
-OpenSky rate-limits anonymous clients.
-
-## Spark package (`src/spark`)
-
-Centralized Spark runtime:
-
-| Module | Role |
-|--------|------|
-| `spark/config.py` | Env-driven `SparkConfig` (master, Kafka, paths, shuffle, driver host) |
-| `spark/session.py` | `create_spark_session(...)` shared by ingest and batch train |
-| `spark/aggregate.py` | Per-aircraft `groupBy` aggregations for GBT training |
-| `spark/ingest.py` | Structured Streaming job |
-
-ML stays under `src/ml` (`features.py`, `train.py`).
-
-## Ingest + continuous learning
-
-`src/spark/ingest.py` uses `spark-sql-kafka`, parses with `OPENSKY_SCHEMA`, runs
-`compute_features` + `add_proxy_label` (column `actual_delay_min` — kinematics
-proxy, not schedule ground truth), appends each micro-batch to Parquet partitioned
-by calendar date `fetched_at_date=YYYY-MM-DD` (from `fetched_at`, UTC), and every
-`RETRAIN_EVERY_N_BATCHES` (default `10`) aggregates snapshots per `icao24` via
-`spark.aggregate.aggregate_for_training` then calls `fit_and_save`.
-
-
-Per-aircraft Spark aggregations (mean/min/max/stddev of distance, altitude,
-velocity, vertical rate, descent gradient, plus sample count) are the GBT
-feature inputs; the label is the mean proxy delay over the track.
-
-| Variable | In-compose default | Host / offline |
-|----------|--------------------|----------------|
-| `KAFKA_BOOTSTRAP_SERVERS` | `kafka:29092` | `localhost:9092` |
-| `KAFKA_TOPIC` | `opensky-states` | same |
-| `SPARK_MASTER` | `spark://spark-master:7077` | `local[*]` |
-| `SPARK_DRIVER_HOST` | `ingest` | (unused for `local[*]`) |
-| `TRAIN_DATA_PATH` | `/data/historical_opensky` | `./data/historical_opensky` |
-| `MODEL_OUTPUT_PATH` | `/models/delay_gbt_pipeline` | `./models/delay_gbt_pipeline` |
-| `CHECKPOINT_PATH` | `/data/checkpoints/opensky_kafka` | `./data/checkpoints/opensky_kafka` |
-| `RETRAIN_EVERY_N_BATCHES` | `10` | same |
-
-## Offline batch train
-
-Against accumulated Parquet (paths above), from the Spark master container:
-
+### Storing Predictions in Cassandra
 ```bash
-docker compose exec spark-master \
-  python3 /opt/project/src/ml/train.py
+make cassandra                   # Starts Cassandra, creates keyspace & tables
+python src/producer/producer.py  # Terminal 1
+CASSANDRA_HOST=localhost make stream # Terminal 2: predicts and writes every micro-batch
 ```
+* **`flights.eta_latest`**: Newest prediction per aircraft (`arr_airport`, `icao24`), expiring after 1 h without refresh.
+* **`flights.eta_history`**: Every prediction per aircraft (`icao24`, `ts DESC`), kept for 7 days.
 
-Or locally with PySpark:
-
+Query latest arrivals via cqlsh:
 ```bash
-PYTHONPATH=src \
-SPARK_MASTER=local[*] \
-TRAIN_DATA_PATH=./data/historical_opensky \
-MODEL_OUTPUT_PATH=./models/delay_gbt_pipeline \
-python src/ml/train.py
+docker compose exec cassandra cqlsh -e "SELECT icao24, callsign, pred_remaining_min, pred_landing_time FROM flights.eta_latest WHERE arr_airport='EDDF';"
 ```
 
+---
 
-## Manual topic create (optional)
+## Configuration
 
-`kafka-init` normally creates the topic. To create it by hand:
+| Variable | Cluster Default | Local Default | Description |
+|----------|-----------------|---------------|-------------|
+| `SPARK_MASTER` | `spark://spark-master:7077` | `local[*]` | Spark master URL |
+| `TRAIN_DATA_PATH` | `hdfs://namenode:8020/data/historical_opensky` | `./data/historical_opensky` | Parquet historical data path |
+| `AIRPORTS_PATH` | `hdfs://namenode:8020/data/airports.csv` | `./data/airports.csv` | Airports CSV file path |
+| `MODEL_OUTPUT_PATH` | `hdfs://namenode:8020/models/eta_gbt_pipeline` | `./models/eta_gbt_pipeline` | Model output directory |
+| `ARRIVAL_AIRPORT` | `EDDF` | `EDDF` | Target destination hub ICAO code |
+| `KAFKA_BOOTSTRAP_SERVERS` | `kafka:29092` | `localhost:9092` | Kafka bootstrap servers |
+| `CASSANDRA_HOST` | `unset` (off) | `localhost` (to enable) | Cassandra host for sink |
+| `DISPLAY_TZ` | `Europe/Berlin` | `Europe/Berlin` | Local wall-clock timezone for arrivals |
 
-```bash
-docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
-	--create \
-	--if-not-exists \
-	--topic opensky-states \
-	--bootstrap-server localhost:9092 \
-	--partitions 1 \
-	--replication-factor 1
-```
+---
 
-## Console consumer
+## Codebase Layout
 
-```bash
-docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
-	--topic opensky-states \
-	--from-beginning \
-	--bootstrap-server localhost:9092
-```
+* `src/producer/producer.py`: Polls OpenSky Network API → Kafka.
+* `src/spark/{config,session,ingest,aggregate}.py`: Spark configuration, session, and streaming ingestion.
+* `src/ml/features.py`: Schema, features, and label extraction.
+* `src/ml/train.py`: Model training, evaluation, and saving.
+* `src/ml/predict.py`: Batch inference and evaluation utilities.
+* `src/ml/predict_stream.py`: Real-time Kafka consumer → inbound filter → prediction stream.
+* `src/data/generate_synthetic.py`: Synthetic history and live data generator for testing.
