@@ -51,6 +51,34 @@ DEFAULT_HISTORY = os.environ.get(
 CACHE_PATH = Path(os.environ.get("VIZ_CACHE_PATH", _DEFAULT_CACHE))
 
 
+@st.cache_data
+def _airport_coords(airports_path: str) -> dict[str, tuple[float, float]]:
+    path = Path(airports_path)
+    if not path.exists():
+        return {HUB_ICAO: (HUB_LAT, HUB_LON)}
+    df = pd.read_csv(path)
+    return {
+        str(r["icao"]).upper(): (float(r["lat"]), float(r["lon"]))
+        for _, r in df.iterrows()
+        if pd.notna(r.get("icao"))
+    }
+
+
+def _hub_for_row(row: pd.Series, airports_path: str = DEFAULT_AIRPORTS) -> tuple[str, float, float]:
+    """Arrival hub ICAO + lat/lon for this prediction (not a hardcoded Frankfurt)."""
+    icao = str(row.get("arr_airport") or HUB_ICAO).strip().upper() or HUB_ICAO
+    coords = _airport_coords(airports_path)
+    lat, lon = coords.get(icao, (HUB_LAT, HUB_LON))
+    return icao, lat, lon
+
+
+def _alt_label(alt_m: float) -> str:
+    """OpenSky baro altitude is metres; also show feet for readability."""
+    if pd.isna(alt_m):
+        return "—"
+    return f"{alt_m:,.0f} m ({alt_m * 3.28084:,.0f} ft)"
+
+
 st.set_page_config(
     page_title="Flight ETA lookup",
     page_icon="✈️",
@@ -179,8 +207,19 @@ def load_predictions(input_path: str, model_path: str, airports_path: str) -> pd
 def render_flight_eta(row: pd.Series) -> None:
     """Current ETA card for the selected airborne flight."""
     callsign = str(row.get("callsign") or "").strip() or "—"
+    hub_icao, _, _ = _hub_for_row(row)
     st.subheader(f"{callsign}")
-    st.caption(f"icao24 `{row['icao24']}` → {row.get('arr_airport', HUB_ICAO)}")
+    as_of = ""
+    if pd.notna(row.get("ts")):
+        as_of = (
+            pd.to_datetime(int(row["ts"]), unit="s", utc=True)
+            .tz_convert(DISPLAY_TZ)
+            .strftime(f"%H:%M:%S {DISPLAY_TZ}")
+        )
+    st.caption(
+        f"icao24 `{row['icao24']}` → **{hub_icao}**"
+        + (f" · OpenSky snapshot {as_of}" if as_of else "")
+    )
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("ETA (remaining)", f"{row['pred_remaining_min']:.0f} min")
@@ -198,11 +237,13 @@ def render_flight_eta(row: pd.Series) -> None:
     else:
         c4.metric("Distance to hub", f"{row.get('dist_to_arr_km', float('nan')):.0f} km")
 
+    hub_icao, hub_lat, hub_lon = _hub_for_row(row)
     d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Altitude", f"{row.get('altitude', float('nan')):,.0f} m")
+    alt_m = row.get("altitude", float("nan"))
+    d1.metric("Altitude", _alt_label(alt_m))
     hdg = row.get("true_track")
     if pd.isna(hdg) and pd.notna(row.get("latitude")):
-        hdg = _bearing_deg(float(row["latitude"]), float(row["longitude"]), HUB_LAT, HUB_LON)
+        hdg = _bearing_deg(float(row["latitude"]), float(row["longitude"]), hub_lat, hub_lon)
     d2.metric("Heading", f"{hdg:.0f}°" if pd.notna(hdg) else "n/a")
     d3.metric("Ground speed", f"{row.get('velocity', float('nan')):.0f} m/s")
     d4.metric("Naive ETA", f"{row.get('naive_eta_min', float('nan')):.0f} min")
@@ -213,20 +254,24 @@ def render_flight_map(row: pd.Series) -> None:
     if pd.isna(row.get("latitude")) or pd.isna(row.get("longitude")):
         return
     lat, lon = float(row["latitude"]), float(row["longitude"])
+    hub_icao, hub_lat, hub_lon = _hub_for_row(row)
     hdg = row.get("true_track")
     if pd.isna(hdg):
-        hdg = _bearing_deg(lat, lon, HUB_LAT, HUB_LON)
-    tip_lat, tip_lon = _destination_point(lat, lon, float(hdg), 60.0)
+        hdg = _bearing_deg(lat, lon, hub_lat, hub_lon)
+    tip_lat, tip_lon = _destination_point(lat, lon, float(hdg), 15.0)
     alt = float(row.get("altitude") or 0.0)
+    dist = float(row.get("dist_to_arr_km") or 500.0)
+    # Zoom in when on final; keep Europe-ish view for long haul.
+    zoom = 9 if dist < 40 else (7 if dist < 200 else 5)
 
     fig = go.Figure()
     fig.add_trace(
         go.Scattermap(
-            lat=[lat, HUB_LAT],
-            lon=[lon, HUB_LON],
+            lat=[lat, hub_lat],
+            lon=[lon, hub_lon],
             mode="lines",
             line={"width": 2, "color": "rgba(80,80,80,0.5)"},
-            name=f"To {HUB_ICAO}",
+            name=f"To {hub_icao}",
             hoverinfo="skip",
         )
     )
@@ -250,12 +295,12 @@ def render_flight_map(row: pd.Series) -> None:
                 "color": [alt],
                 "colorscale": "Turbo",
                 "cmin": 0,
-                "cmax": 11000,
+                "cmax": 12000,
                 "colorbar": {"title": "Alt (m)", "thickness": 10},
             },
             text=[
                 f"{row.get('callsign', row['icao24'])}<br>"
-                f"Alt {alt:,.0f} m<br>ETA {row['pred_remaining_min']:.0f} min"
+                f"Alt {_alt_label(alt)}<br>ETA {row['pred_remaining_min']:.0f} min"
             ],
             hovertemplate="%{text}<extra></extra>",
             name="Aircraft",
@@ -263,11 +308,11 @@ def render_flight_map(row: pd.Series) -> None:
     )
     fig.add_trace(
         go.Scattermap(
-            lat=[HUB_LAT],
-            lon=[HUB_LON],
+            lat=[hub_lat],
+            lon=[hub_lon],
             mode="markers+text",
             marker={"size": 14, "color": "crimson"},
-            text=[HUB_ICAO],
+            text=[hub_icao],
             textposition="top right",
             name="Hub",
             hoverinfo="skip",
@@ -276,7 +321,7 @@ def render_flight_map(row: pd.Series) -> None:
     fig.update_layout(
         margin={"l": 0, "r": 0, "t": 0, "b": 0},
         height=360,
-        map={"style": "carto-positron", "center": {"lat": lat, "lon": lon}, "zoom": 5},
+        map={"style": "carto-positron", "center": {"lat": (lat + hub_lat) / 2, "lon": (lon + hub_lon) / 2}, "zoom": zoom},
         showlegend=False,
         uirevision=f"flight-{row['icao24']}",
     )
@@ -362,7 +407,7 @@ def render_prediction_history(icao24: str) -> None:
     show = hist[
         [c for c in [
             "pred_at_local", "arr_airport", "pred_remaining_min",
-            "dist_to_arr_km", "altitude", "pred_landing_time",
+            "dist_to_arr_km", "altitude", "latitude", "longitude", "pred_landing_time",
         ] if c in hist.columns]
     ].rename(columns={
         "pred_at_local": "predicted_at",
@@ -374,7 +419,9 @@ def render_prediction_history(icao24: str) -> None:
     if "dist_km" in show.columns:
         show["dist_km"] = show["dist_km"].round(0)
     if "altitude" in show.columns:
+        show["alt_ft"] = (show["altitude"] * 3.28084).round(0)
         show["altitude"] = show["altitude"].round(0)
+        show = show.rename(columns={"altitude": "alt_m"})
     st.dataframe(show, width="stretch", hide_index=True)
 
 
@@ -429,22 +476,30 @@ def render_fleet_map(df: pd.DataFrame, highlight: str | None = None) -> None:
     if plot_df.empty:
         st.warning("No positioned flights.")
         return
+    coords = _airport_coords(DEFAULT_AIRPORTS)
     plot_df["altitude_m"] = plot_df["altitude"].fillna(0.0)
+    plot_df["hub_icao"] = plot_df.get("arr_airport", HUB_ICAO).fillna(HUB_ICAO).astype(str).str.upper()
+    plot_df["hub_lat"] = plot_df["hub_icao"].map(lambda c: coords.get(c, (HUB_LAT, HUB_LON))[0])
+    plot_df["hub_lon"] = plot_df["hub_icao"].map(lambda c: coords.get(c, (HUB_LAT, HUB_LON))[1])
     if "true_track" in plot_df.columns and plot_df["true_track"].notna().any():
         plot_df["heading_deg"] = plot_df["true_track"].astype(float)
     else:
         plot_df["heading_deg"] = [
-            _bearing_deg(a, b, HUB_LAT, HUB_LON)
-            for a, b in zip(plot_df["latitude"], plot_df["longitude"])
+            _bearing_deg(a, b, hl, hn)
+            for a, b, hl, hn in zip(
+                plot_df["latitude"], plot_df["longitude"], plot_df["hub_lat"], plot_df["hub_lon"]
+            )
         ]
     plot_df["label"] = plot_df.apply(_flight_label, axis=1)
 
     fig = go.Figure()
     line_lat: list[float | None] = []
     line_lon: list[float | None] = []
-    for lat, lon in zip(plot_df["latitude"], plot_df["longitude"]):
-        line_lat.extend([float(lat), HUB_LAT, None])
-        line_lon.extend([float(lon), HUB_LON, None])
+    for lat, lon, hl, hn in zip(
+        plot_df["latitude"], plot_df["longitude"], plot_df["hub_lat"], plot_df["hub_lon"]
+    ):
+        line_lat.extend([float(lat), float(hl), None])
+        line_lon.extend([float(lon), float(hn), None])
     fig.add_trace(
         go.Scattermap(
             lat=line_lat,
@@ -459,8 +514,10 @@ def render_fleet_map(df: pd.DataFrame, highlight: str | None = None) -> None:
     alt_max = max(float(alt.max()), 1.0)
     hover = (
         plot_df["label"]
+        + "<br>→ "
+        + plot_df["hub_icao"]
         + "<br>Alt "
-        + plot_df["altitude_m"].map(lambda x: f"{x:,.0f} m")
+        + plot_df["altitude_m"].map(_alt_label)
         + "<br>HDG "
         + plot_df["heading_deg"].map(lambda x: f"{x:.0f}°")
         + "<br>ETA "
@@ -476,7 +533,7 @@ def render_fleet_map(df: pd.DataFrame, highlight: str | None = None) -> None:
                 "color": plot_df["altitude_m"],
                 "colorscale": "Turbo",
                 "cmin": 0,
-                "cmax": max(alt_max, 11000.0),
+                "cmax": max(alt_max, 12000.0),
                 "colorbar": {"title": "Altitude (m)", "thickness": 12},
             },
             customdata=np.stack([hover.to_numpy()], axis=-1),
@@ -497,15 +554,20 @@ def render_fleet_map(df: pd.DataFrame, highlight: str | None = None) -> None:
                     hoverinfo="skip",
                 )
             )
+    hubs = (
+        plot_df[["hub_icao", "hub_lat", "hub_lon"]]
+        .drop_duplicates("hub_icao")
+        .dropna()
+    )
     fig.add_trace(
         go.Scattermap(
-            lat=[HUB_LAT],
-            lon=[HUB_LON],
+            lat=hubs["hub_lat"],
+            lon=hubs["hub_lon"],
             mode="markers+text",
-            marker={"size": 16, "color": "crimson"},
-            text=[HUB_ICAO],
+            marker={"size": 12, "color": "crimson"},
+            text=hubs["hub_icao"],
             textposition="top right",
-            name="Hub",
+            name="Hubs",
             hoverinfo="skip",
         )
     )
@@ -513,7 +575,7 @@ def render_fleet_map(df: pd.DataFrame, highlight: str | None = None) -> None:
         margin={"l": 0, "r": 0, "t": 0, "b": 0},
         height=520,
         map={"style": "carto-positron", "center": EUROPE_CENTER, "zoom": EUROPE_ZOOM},
-        uirevision="europe-eddf",
+        uirevision="europe-hubs",
         showlegend=False,
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -608,6 +670,14 @@ def main() -> None:
         history_path = st.text_input("Historical flights", DEFAULT_HISTORY)
 
     if use_cassandra:
+        # Auto-refresh so ETAs track the per-minute stream upserts.
+        try:
+            from streamlit_autorefresh import st_autorefresh
+
+            st_autorefresh(interval=60_000, key="cassandra_live_refresh")
+        except ImportError:
+            st.caption("Tip: `pip install streamlit-autorefresh` for automatic 60s UI refresh.")
+
         try:
             from viz.cassandra_source import list_arrival_airports
 
@@ -629,12 +699,15 @@ def main() -> None:
         if df.empty:
             st.warning(
                 "No live predictions yet. Start `make producer` and `make stream-live`, "
-                "wait ~15–30s, then refresh."
+                "wait ~1 minute, then refresh."
             )
             st.stop()
-        st.info(f"Live Cassandra: **{len(df)}** aircraft"
-                + (f" inbound to **{arr}**" if arr else " across European hubs")
-                + ". Search by callsign / icao24 below (e.g. `3c6744`).")
+        st.info(
+            f"Live Cassandra: **{len(df)}** aircraft"
+            + (f" inbound to **{arr}**" if arr else " across European hubs")
+            + ". Rescored about **every minute** from OpenSky→Kafka while airborne. "
+            "Search callsign / icao24 below."
+        )
         landings = pd.DataFrame()
     else:
         df = load_predictions(input_path, model_path, airports_path)

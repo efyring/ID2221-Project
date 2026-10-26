@@ -141,14 +141,36 @@ def check_cassandra(spark, keyspace: str) -> None:
             ) from exc
 
 
+def _sync_cassandra_python(preds: DataFrame) -> int:
+    """Upsert this micro-batch via cassandra-driver (no Spark Cassandra connector)."""
+    from viz.sync_cassandra import sync
+
+    pdf = preds.select(*[c for c in CASSANDRA_COLUMNS if c in preds.columns]).toPandas()
+    return sync(pdf)
+
+
 def make_batch_handler(model, airports, hubs, config, max_km, max_angle, out_path):
-    use_cassandra = config.cassandra_host is not None
+    # Prefer Python Cassandra sync when CASSANDRA_HOST is set (avoids Ivy jar downloads).
+    use_cassandra_spark = (
+        config.cassandra_host is not None
+        and os.getenv("CASSANDRA_SPARK_SINK", "").lower() in {"1", "true", "yes"}
+    )
+    use_cassandra_python = (
+        config.cassandra_host is not None and not use_cassandra_spark
+    )
     multi = hubs.count() > 1
 
     def handle(raw_batch: DataFrame, batch_id: int) -> None:
         if raw_batch.isEmpty():
             return
-        raw_batch = raw_batch.persist()
+        # One row per aircraft: keep the freshest OpenSky snapshot in this minute.
+        w = Window.partitionBy("icao24").orderBy(F.col("fetched_at").desc())
+        raw_batch = (
+            raw_batch.withColumn("_rn", F.row_number().over(w))
+            .filter(F.col("_rn") == 1)
+            .drop("_rn")
+            .persist()
+        )
         if multi:
             preds = live_predictions_multi(
                 raw_batch, model, airports, hubs, max_km, max_angle
@@ -170,14 +192,18 @@ def make_batch_handler(model, airports, hubs, config, max_km, max_angle, out_pat
                 for r in preds.groupBy("arr_airport").count().collect()
             }
             LOGGER.info(
-                "Batch %s: %d states → %d inbound %s",
+                "Batch %s: %d unique aircraft → %d inbound %s",
                 batch_id, n_raw, n_inbound, by_hub,
             )
-            preds.orderBy("pred_remaining_min").show(25, truncate=False)
-            if use_cassandra:
+            preds.orderBy("pred_remaining_min").show(15, truncate=False)
+            if use_cassandra_spark:
                 write_cassandra(preds, config.cassandra_keyspace)
-                LOGGER.info("Batch %s → Cassandra.%s", batch_id, config.cassandra_keyspace)
+                LOGGER.info("Batch %s → Cassandra.%s (Spark sink)", batch_id, config.cassandra_keyspace)
+            elif use_cassandra_python:
+                n = _sync_cassandra_python(preds)
+                LOGGER.info("Batch %s → Cassandra (%d upserts, python driver)", batch_id, n)
             if out_path:
+                # overwrite-style snapshot dir per batch is heavy; append keeps history
                 preds.write.mode("append").parquet(out_path)
         finally:
             preds.unpersist()
@@ -190,8 +216,15 @@ def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     config = offline_config()
     use_cassandra = config.cassandra_host is not None
+    use_cassandra_spark = (
+        use_cassandra
+        and os.getenv("CASSANDRA_SPARK_SINK", "").lower() in {"1", "true", "yes"}
+    )
     spark = create_spark_session(
-        "OpenSky-ETA-Stream", enable_kafka=True, enable_cassandra=use_cassandra, config=config
+        "OpenSky-ETA-Stream",
+        enable_kafka=True,
+        enable_cassandra=use_cassandra_spark,
+        config=config,
     )
 
     airports = load_airports(spark, config.airports_path)
@@ -199,11 +232,15 @@ def main() -> None:
     n_hubs = hubs.count()
     if n_hubs == 0:
         raise SystemExit("No arrival hubs configured — check AIRPORTS_PATH / ARRIVAL_AIRPORTS")
-    LOGGER.info("Scoring inbound traffic to %d hubs", n_hubs)
+    trigger_s = int(os.getenv("TRIGGER_SECONDS", "60"))
+    LOGGER.info(
+        "Scoring inbound traffic to %d hubs every %ds (Cassandra=%s)",
+        n_hubs, trigger_s, "on" if use_cassandra else "off",
+    )
     hubs.show(50, truncate=False)
 
     model = PipelineModel.load(config.model_output_path)
-    if use_cassandra:
+    if use_cassandra_spark:
         check_cassandra(spark, config.cassandra_keyspace)
 
     raw = (
@@ -211,6 +248,7 @@ def main() -> None:
         .option("kafka.bootstrap.servers", config.kafka_bootstrap_servers)
         .option("subscribe", config.kafka_topic)
         .option("startingOffsets", "latest")
+        .option("failOnDataLoss", "false")
         .load()
     )
     parsed = (
@@ -229,7 +267,7 @@ def main() -> None:
         .option("checkpointLocation", os.getenv(
             "STREAM_CHECKPOINT_PATH", "./data/checkpoints/eta_stream"
         ))
-        .trigger(processingTime=f"{os.getenv('TRIGGER_SECONDS', '15')} seconds")
+        .trigger(processingTime=f"{trigger_s} seconds")
         .start()
     )
     query.awaitTermination()

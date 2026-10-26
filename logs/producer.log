@@ -1,0 +1,25 @@
+/Users/juozas/Documents/Projects/kth/ID2221-Project/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+/Users/juozas/Documents/Projects/kth/ID2221-Project/src/producer/producer.py:98: DeprecationWarning: key_serializer does not implement kafka.serializer.Serializer
+  producer = create_producer(bootstrap_servers)
+/Users/juozas/Documents/Projects/kth/ID2221-Project/src/producer/producer.py:98: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
+  producer = create_producer(bootstrap_servers)
+INFO:kafka.net.manager:Attempting bootstrap to bootstrap-0 at localhost:9092 (rack None)
+INFO:kafka.net.manager:Initializing connection for node_id bootstrap-0 at localhost:9092 (rack=None)
+INFO:kafka.net.transport:<KafkaTCPTransport [::1:9092<-59346]>: connected to <socket.socket fd=11, family=AddressFamily.AF_INET6, type=SocketKind.SOCK_STREAM, proto=6, laddr=('::1', 59346, 0, 0), raddr=('::1', 9092, 0, 0)>
+INFO:kafka.net.connection:<KafkaConnection node_id=bootstrap-0 host=[::1:9092<-59346] broker_version=unknown (initializing)>: Broker version identified as 4.0
+INFO:kafka.net.connection:<KafkaConnection node_id=bootstrap-0 host=[::1:9092<-59346] broker_version=(4, 0) (connected)>: Connected
+INFO:kafka.cluster:Updated metadata: ClusterMetadata(brokers: 1, topics: 0, coordinators: 0)
+INFO:kafka.net.manager:Bootstrap complete: ClusterMetadata(brokers: 1, topics: 0, coordinators: 0)
+INFO:kafka.net.manager:Closing bootstrap connection bootstrap-0
+INFO:kafka.net.transport:<KafkaTCPTransport [::1:9092<-59346]>: Closing transport
+INFO:kafka.net.connection:<KafkaConnection node_id=bootstrap-0 broker_version=(4, 0) (disconnected)>: Connection closed
+INFO:kafka.cluster:Starting metadata refresh loop
+INFO:kafka.producer.kafka:<KafkaProducer client_id=kafka-python-producer-1 transactional_id=None>: Instantiated an idempotent producer.
+INFO:kafka.producer.transaction_manager:ProducerId set to -1 with epoch -1
+INFO:kafka.net.manager:Initializing connection for node_id 1 at localhost:9092 (rack=None)
+INFO:kafka.net.transport:<KafkaTCPTransport [::1:9092<-59347]>: connected to <socket.socket fd=12, family=AddressFamily.AF_INET6, type=SocketKind.SOCK_STREAM, proto=6, laddr=('::1', 59347, 0, 0), raddr=('::1', 9092, 0, 0)>
+INFO:kafka.net.connection:<KafkaConnection node_id=1 host=[::1:9092<-59347] broker_version=(4, 0) (connected)>: Connected
+INFO:kafka.producer.transaction_manager:ProducerId set to 10 with epoch 0
+INFO:kafka.cluster:Updated metadata: ClusterMetadata(brokers: 1, topics: 1, coordinators: 0)
+INFO:__main__:Published 11066 aircraft states to opensky-states

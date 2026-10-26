@@ -57,26 +57,32 @@ train-live: ## train GBT on local labelled seed (synthetic or enriched), save un
 	python src/ml/train.py
 	@mkdir -p models/synthetic && rm -rf models/synthetic/eta_gbt_pipeline && cp -R models/live/eta_gbt_pipeline models/synthetic/eta_gbt_pipeline
 
-producer: ## poll OpenSky → Kafka (foreground; Ctrl+C to stop)
-	KAFKA_BOOTSTRAP_SERVERS=localhost:9092 python src/producer/producer.py
-
-stream-live: ## Kafka → European hubs → model → local parquet (then: make sync-cassandra)
+producer: ## poll OpenSky → Kafka every minute (foreground; Ctrl+C to stop)
 	KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
+	POLL_INTERVAL_SECONDS=$${POLL_INTERVAL_SECONDS:-60} \
+	python src/producer/producer.py
+
+stream-live: ## Kafka → rescore inbound EU flights every minute → Cassandra + parquet
+	CASSANDRA_HOST=localhost \
+	KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
+	TRIGGER_SECONDS=$${TRIGGER_SECONDS:-60} \
+	ARRIVAL_AIRPORTS=$${ARRIVAL_AIRPORTS:-ESSA,EKCH,EDDF,EHAM,LFPG,EGLL,LEMD,LIRF,LOWW,EPWA} \
 	AIRPORTS_PATH=./data/airports.csv \
 	MODEL_OUTPUT_PATH=./models/synthetic/eta_gbt_pipeline \
 	PREDICTIONS_PATH=./data/live/stream_predictions \
 	STREAM_CHECKPOINT_PATH=./data/checkpoints/eta_stream \
+	SPARK_DRIVER_MEMORY=$${SPARK_DRIVER_MEMORY:-4g} \
 	python src/ml/predict_stream.py
 
-sync-cassandra: ## push newest stream parquet predictions into Cassandra
+sync-cassandra: ## manually push newest stream parquet predictions into Cassandra
 	CASSANDRA_HOST=localhost python src/viz/sync_cassandra.py
 
 pipeline: data stack-up cassandra seed-hdfs train-live ## bring up full live path (then run producer + stream-live + viz-cassandra)
 	@echo ""
 	@echo "Pipeline ready. In three terminals run:"
-	@echo "  make producer      # OpenSky → Kafka"
-	@echo "  make stream-live   # Kafka → ETA → Cassandra"
-	@echo "  make viz-cassandra # Streamlit search UI"
+	@echo "  make producer      # OpenSky → Kafka every 60s"
+	@echo "  make stream-live   # Kafka → ETA every 60s → Cassandra"
+	@echo "  make viz-cassandra # Streamlit (auto-refresh ~60s)"
 	@echo ""
 
 viz:       ## Streamlit (parquet cache / synthetic)

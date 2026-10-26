@@ -80,6 +80,7 @@ class SparkConfig:
             "spark.sql.session.timeZone": "UTC",
             # Absolute ivy path — Bitnami user 1001 often has no usable $HOME.
             "spark.jars.ivy": self.ivy_path,
+            "spark.driver.memory": os.getenv("SPARK_DRIVER_MEMORY", "4g"),
         }
         packages = []
         if enable_kafka:

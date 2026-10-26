@@ -83,8 +83,9 @@ def load_eta_history(icao24: str, host: str | None = None, keyspace: str = "flig
     session = cluster.connect(keyspace)
     try:
         rows = session.execute(
-            "SELECT icao24, ts, arr_airport, callsign, dist_to_arr_km, altitude, "
-            "velocity, vertical_rate, pred_remaining_min, pred_landing_ts, pred_landing_time "
+            "SELECT icao24, ts, arr_airport, callsign, latitude, longitude, "
+            "dist_to_arr_km, altitude, velocity, vertical_rate, "
+            "pred_remaining_min, pred_landing_ts, pred_landing_time "
             "FROM eta_history WHERE icao24 = %s LIMIT %s",
             [icao24, limit],
         )

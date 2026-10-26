@@ -79,14 +79,16 @@ Requires Docker, Java 17+, and Python deps (`pip install -r requirements.txt`).
 ```bash
 make pipeline          # train seed → Docker stack → Cassandra → HDFS dirs → train model
 # then (keep running):
-make producer          # Terminal 1: OpenSky HTTP → Kafka
-make stream-live       # Terminal 2: Kafka → inbound EU hubs → GBT → parquet
-make sync-cassandra    # push latest parquet → Cassandra (re-run periodically)
-make viz-cassandra     # Terminal 3: Streamlit search UI
+make producer          # Terminal 1: OpenSky → Kafka every 60s
+make stream-live       # Terminal 2: Kafka → rescore inbound EU flights every 60s → Cassandra
+make viz-cassandra     # Terminal 3: Streamlit (auto-refresh ~60s)
 ```
 
-UI: filter by arrival airport (EDDF, EHAM, LFPG, …) and search callsign / icao24.  
-Note: a given aircraft only appears while the inbound heuristic classifies it toward a hub.
+Each minute the stream takes the latest OpenSky state per airborne aircraft from Kafka,
+re-runs the GBT, and upserts `flights.eta_latest` / appends `eta_history` so ETAs track
+live position, speed, and altitude until the flight leaves the inbound set.
+
+UI: filter by arrival airport (EDDF, EHAM, LFPG, …) and search callsign / icao24.
 
 ## Streamlit Visualization (offline / synthetic)
 

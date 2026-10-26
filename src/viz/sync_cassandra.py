@@ -46,6 +46,15 @@ def sync(df: pd.DataFrame | None = None) -> int:
         ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     n = 0
+    batch = BatchStatement(consistency_level=ConsistencyLevel.ONE)
+    batch_size = 50
+
+    def _flush() -> None:
+        nonlocal batch
+        if batch:
+            session.execute(batch)
+            batch = BatchStatement(consistency_level=ConsistencyLevel.ONE)
+
     for _, r in df.iterrows():
         callsign = None if pd.isna(r.get("callsign")) else str(r.get("callsign"))
         landing = None
@@ -67,12 +76,12 @@ def sync(df: pd.DataFrame | None = None) -> int:
             int(r["pred_landing_ts"]) if pd.notna(r.get("pred_landing_ts")) else None,
             landing,
         )
-        session.execute(insert_latest, vals)
-        session.execute(
-            insert_hist,
-            (vals[1], vals[3], vals[0], vals[2], *vals[4:]),
-        )
+        batch.add(insert_latest, vals)
+        batch.add(insert_hist, (vals[1], vals[3], vals[0], vals[2], *vals[4:]))
         n += 1
+        if n % batch_size == 0:
+            _flush()
+    _flush()
     cluster.shutdown()
     print(f"Synced {n} rows → Cassandra {KEYSPACE}.eta_latest / eta_history")
     return n
