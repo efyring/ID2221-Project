@@ -1,12 +1,16 @@
 """Real-time ETA: Kafka -> inbound European hubs -> model -> Cassandra / parquet."""
 
+from __future__ import annotations
+
 import logging
 import os
+from typing import Optional
 
 from pyspark.ml import PipelineModel
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
+from ml.airport_alt import APPROACH_AGL_M, DEFAULT_DECISION_HEIGHT_AGL_M
 from ml.features import OPENSKY_SCHEMA, _haversine_km, load_airports
 from ml.predict import predict
 from ml.train import offline_config
@@ -22,21 +26,40 @@ def _bearing_deg(lat1, lon1, lat2, lon2):
     return F.pmod(F.degrees(F.atan2(x, y)) + 360.0, F.lit(360.0))
 
 
-def inbound_condition(hub_lat, hub_lon, max_km: float, max_angle: float):
-    """Column expression for "probably landing at this hub" (lat/lon may be literals or columns)."""
+def inbound_condition(
+    hub_lat,
+    hub_lon,
+    max_km: float,
+    max_angle: float,
+    hub_elev_m=None,
+    hub_dh_m=None,
+):
+    """Inbound / approaching this hub; landed once baro ≤ decision height MSL."""
+    elev = hub_elev_m if hub_elev_m is not None else F.lit(0.0)
+    dh = hub_dh_m if hub_dh_m is not None else (elev + F.lit(DEFAULT_DECISION_HEIGHT_AGL_M))
     dist = _haversine_km(F.col("latitude"), F.col("longitude"), hub_lat, hub_lon)
     brg = _bearing_deg(F.col("latitude"), F.col("longitude"), hub_lat, hub_lon)
     off = F.abs(F.pmod(F.col("true_track") - brg + 540.0, F.lit(360.0)) - 180.0)
+    baro = F.coalesce(F.col("baro_altitude"), F.lit(0.0))
+    agl = baro - elev
     airborne = ~F.coalesce(F.col("on_ground"), F.lit(False))
     has_pos = F.col("latitude").isNotNull() & F.col("longitude").isNotNull()
+    # At/below decision height MSL near the field ⇒ considered landed.
+    landed = (baro <= dh) & (dist <= 40.0)
     fast_enough = F.coalesce(F.col("velocity"), F.lit(0.0)) >= 55.0
     heading_in = (dist > 60.0) & (dist <= max_km) & (off <= max_angle)
-    low_and_close = (
+    # Still approaching while AGL ≤ 2000 ft (and still above decision height).
+    approaching = (
         (dist <= 60.0)
-        & (F.coalesce(F.col("baro_altitude"), F.lit(0.0)) < 5000.0)
+        & (agl <= APPROACH_AGL_M)
+        & (baro > dh)
         & (F.coalesce(F.col("vertical_rate"), F.lit(0.0)) <= 0.5)
     )
-    return airborne & has_pos & fast_enough & (heading_in | low_and_close), dist
+    return (
+        airborne & has_pos & ~landed & (heading_in | approaching)
+        & (fast_enough | approaching),
+        dist,
+    )
 
 
 CASSANDRA_COLUMNS = [
@@ -69,6 +92,8 @@ def european_hubs(airports: DataFrame) -> DataFrame:
         F.col("icao").alias("hub_icao"),
         F.col("lat").alias("hub_lat"),
         F.col("lon").alias("hub_lon"),
+        F.col("elev_m").alias("hub_elev_m"),
+        F.col("decision_height_m").alias("hub_dh_m"),
     )
     if raw:
         codes = [c.strip().upper() for c in raw.split(",") if c.strip()]
@@ -86,9 +111,15 @@ def live_predictions(
     arr_airport: str,
     max_km: float,
     max_angle: float,
+    hub_elev_m: float = 0.0,
+    hub_dh_m: Optional[float] = None,
 ) -> DataFrame:
     """Single-hub path (kept for predict_opensky / demos)."""
-    cond, _ = inbound_condition(F.lit(hub_lat), F.lit(hub_lon), max_km, max_angle)
+    dh = hub_dh_m if hub_dh_m is not None else hub_elev_m + DEFAULT_DECISION_HEIGHT_AGL_M
+    cond, _ = inbound_condition(
+        F.lit(hub_lat), F.lit(hub_lon), max_km, max_angle,
+        hub_elev_m=F.lit(hub_elev_m), hub_dh_m=F.lit(dh),
+    )
     inbound = (
         parsed.filter(cond)
         .withColumn("arr_airport", F.lit(arr_airport))
@@ -108,7 +139,10 @@ def live_predictions_multi(
 ) -> DataFrame:
     """Assign each state to the closest European hub it is inbound toward."""
     paired = parsed.crossJoin(F.broadcast(hubs))
-    cond, dist = inbound_condition(F.col("hub_lat"), F.col("hub_lon"), max_km, max_angle)
+    cond, dist = inbound_condition(
+        F.col("hub_lat"), F.col("hub_lon"), max_km, max_angle,
+        hub_elev_m=F.col("hub_elev_m"), hub_dh_m=F.col("hub_dh_m"),
+    )
     inbound = (
         paired.filter(cond)
         .withColumn("_dist_hub", dist)
@@ -122,7 +156,7 @@ def live_predictions_multi(
         .withColumn("arr_airport", F.col("hub_icao"))
         .withColumn("ts", F.col("fetched_at"))
         .withColumn("callsign", F.trim(F.col("callsign")))
-        .drop("hub_icao", "hub_lat", "hub_lon", "_dist_hub", "_rn")
+        .drop("hub_icao", "hub_lat", "hub_lon", "hub_elev_m", "hub_dh_m", "_dist_hub", "_rn")
     )
     return predict(model, inbound, airports)
 
@@ -181,6 +215,8 @@ def make_batch_handler(model, airports, hubs, config, max_km, max_angle, out_pat
                 raw_batch, model, airports,
                 float(hub["hub_lat"]), float(hub["hub_lon"]), hub["hub_icao"],
                 max_km, max_angle,
+                hub_elev_m=float(hub["hub_elev_m"] or 0.0),
+                hub_dh_m=float(hub["hub_dh_m"]),
             ).persist()
         try:
             n_raw, n_inbound = raw_batch.count(), preds.count()

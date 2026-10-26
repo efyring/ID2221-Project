@@ -2,6 +2,9 @@
 
 Used to turn raw ingested states into labelled training rows
 (``arr_airport``, ``actual_arrival_ts``, ``ts``).
+
+Landing = first time barometric altitude reaches the airport's decision height
+(MSL). Approach band remains ≤ ~2000 ft AGL above field elevation.
 """
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ from __future__ import annotations
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
+from ml.airport_alt import APPROACH_AGL_M
 from ml.features import _haversine_km
 
 FLIGHT_GAP_SEC = 45 * 60
@@ -17,7 +21,6 @@ MIN_DESCENT_SAMPLES = 3
 MAX_DESCENT_RATE_MPS = 0.5
 MIN_DESCENT_RATE_MPS = -0.05
 MAX_APPROACH_DIST_KM = 40.0
-APPROACH_AGL_M = 2000.0 * 0.3048  # ~2000 ft
 
 
 def _with_ts(states: DataFrame) -> DataFrame:
@@ -57,12 +60,13 @@ def _with_descent_flag(states: DataFrame) -> DataFrame:
 
 
 def _approach_assignments(states: DataFrame, airports: DataFrame) -> DataFrame:
-    """Rows in approach: AGL < 2000 ft vs airport elev, descending, nearest airport."""
+    """Rows in approach: AGL ≤ 2000 ft vs airport elev, descending, nearest airport."""
     apt = airports.select(
         F.col("icao").alias("_apt_icao"),
         F.col("lat").alias("_apt_lat"),
         F.col("lon").alias("_apt_lon"),
         F.coalesce(F.col("elev_m"), F.lit(0.0)).alias("_apt_elev_m"),
+        F.col("decision_height_m").alias("_apt_dh_m"),
     )
     paired = states.crossJoin(F.broadcast(apt)).withColumn(
         "_dist_km",
@@ -86,6 +90,7 @@ def _approach_assignments(states: DataFrame, airports: DataFrame) -> DataFrame:
             F.col("_apt_icao").alias("approach_airport"),
             F.col("_dist_km").alias("approach_dist_km"),
             F.col("_agl_m").alias("approach_agl_m"),
+            F.col("_apt_dh_m").alias("approach_dh_m"),
         )
     )
     return nearest
@@ -114,8 +119,8 @@ def _flight_segments(states: DataFrame) -> DataFrame:
 def enrich_arrivals(states: DataFrame, airports: DataFrame) -> DataFrame:
     """Return airborne snapshots labelled with ``arr_airport`` and ``actual_arrival_ts``.
 
-    Landing time = last timestamp of a flight segment that entered approach
-    to an airport (low AGL + descending near that airport).
+    Approach: within 40 km, ≤ ~2000 ft AGL, gradually descending.
+    Landing time: first sample at/below that airport's ``decision_height_m`` (MSL).
     """
     base = _with_ts(states).filter(
         F.col("latitude").isNotNull() & F.col("longitude").isNotNull() & F.col("ts").isNotNull()
@@ -132,8 +137,55 @@ def enrich_arrivals(states: DataFrame, airports: DataFrame) -> DataFrame:
                 flight_w.rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
             ),
         )
-        .withColumn("actual_arrival_ts", F.max("ts").over(flight_w))
+        .withColumn(
+            "arr_decision_height_m",
+            F.last("approach_dh_m", ignorenulls=True).over(
+                flight_w.rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
+            ),
+        )
+    )
+
+    # Join decision height if approach never attached dh (fallback via airports).
+    dh = airports.select(
+        F.col("icao").alias("arr_airport"),
+        F.col("decision_height_m").alias("_dh_m"),
+        F.col("lat").alias("_arr_lat"),
+        F.col("lon").alias("_arr_lon"),
+    )
+    labelled = (
+        labelled.join(F.broadcast(dh), "arr_airport", "left")
+        .withColumn(
+            "arr_decision_height_m",
+            F.coalesce(F.col("arr_decision_height_m"), F.col("_dh_m")),
+        )
+        .withColumn(
+            "_dist_arr_km",
+            _haversine_km(
+                F.col("latitude"), F.col("longitude"), F.col("_arr_lat"), F.col("_arr_lon")
+            ),
+        )
+        .withColumn(
+            "_at_decision_height",
+            (F.col("arr_decision_height_m").isNotNull())
+            & (F.coalesce(F.col("baro_altitude"), F.lit(1e9)) <= F.col("arr_decision_height_m"))
+            & (F.col("_dist_arr_km") <= MAX_APPROACH_DIST_KM),
+        )
+        .withColumn(
+            "actual_arrival_ts",
+            F.min(
+                F.when(F.col("_at_decision_height"), F.col("ts"))
+            ).over(flight_w),
+        )
         .filter(F.col("arr_airport").isNotNull())
+        .filter(F.col("actual_arrival_ts").isNotNull())
         .filter(~F.coalesce(F.col("on_ground"), F.lit(False)))
+        # Keep only pre-landing airborne samples (above decision height).
+        .filter(F.coalesce(F.col("baro_altitude"), F.lit(0.0)) > F.col("arr_decision_height_m"))
+        .filter(F.col("ts") <= F.col("actual_arrival_ts"))
+        .drop(
+            "approach_airport", "approach_dist_km", "approach_agl_m", "approach_dh_m",
+            "_dh_m", "_arr_lat", "_arr_lon", "_dist_arr_km", "_at_decision_height",
+            "arr_decision_height_m", "gradually_descending", "flight_seg",
+        )
     )
     return labelled

@@ -11,6 +11,8 @@ from pyspark.sql.types import (
     StructType,
 )
 
+from ml.airport_alt import DEFAULT_DECISION_HEIGHT_AGL_M
+
 OPENSKY_SCHEMA = StructType([
     StructField("icao24", StringType(), True),
     StructField("callsign", StringType(), True),
@@ -47,12 +49,27 @@ FEATURE_COLS = [
 
 
 def load_airports(spark: SparkSession, path: str) -> DataFrame:
-    """Read the airport lookup CSV (columns: icao, lat, lon[, elev_m])."""
+    """Read airports CSV: ``icao,lat,lon[,elev_m][,decision_height_m]``.
+
+    ``decision_height_m`` is absolute MSL (baro). When omitted it defaults to
+    field elevation + CAT I decision height (~200 ft AGL).
+    """
     raw = spark.read.csv(path, header=True, inferSchema=True)
-    cols = ["icao", "lat", "lon"]
-    if "elev_m" in raw.columns:
-        cols.append("elev_m")
-    return raw.select(*cols)
+    if "elev_m" not in raw.columns:
+        raw = raw.withColumn("elev_m", F.lit(0.0))
+    if "decision_height_m" not in raw.columns:
+        raw = raw.withColumn("decision_height_m", F.lit(None).cast("double"))
+    return raw.select(
+        F.col("icao").cast("string").alias("icao"),
+        F.col("lat").cast("double").alias("lat"),
+        F.col("lon").cast("double").alias("lon"),
+        F.coalesce(F.col("elev_m").cast("double"), F.lit(0.0)).alias("elev_m"),
+        F.coalesce(
+            F.col("decision_height_m").cast("double"),
+            F.coalesce(F.col("elev_m").cast("double"), F.lit(0.0))
+            + F.lit(DEFAULT_DECISION_HEIGHT_AGL_M),
+        ).alias("decision_height_m"),
+    )
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):
@@ -79,19 +96,25 @@ def add_features(df: DataFrame, airports: DataFrame) -> DataFrame:
         F.col("icao").alias("arr_airport"),
         F.col("lat").alias("arr_lat"),
         F.col("lon").alias("arr_lon"),
+        F.col("elev_m").alias("arr_elev_m"),
+        F.col("decision_height_m").alias("arr_decision_height_m"),
     )
     out = out.join(F.broadcast(arr), "arr_airport")
 
     velocity = F.coalesce(F.col("velocity"), F.lit(0.0))
     speed_kmh = F.greatest(velocity * 3.6, F.lit(50.0))  # floor keeps ETA finite
     dist_to_arr = _haversine_km(F.col("latitude"), F.col("longitude"), F.col("arr_lat"), F.col("arr_lon"))
+    altitude = F.coalesce(F.col("baro_altitude"), F.lit(0.0))
     ts = F.timestamp_seconds("ts")
+
+    # Landed once baro MSL reaches the airport decision height — drop those rows.
+    out = out.filter(altitude > F.col("arr_decision_height_m"))
 
     return (
         out.withColumn("dist_to_arr_km", dist_to_arr)
         # Simple physics baseline: distance left / current ground speed.
         .withColumn("naive_eta_min", F.col("dist_to_arr_km") / speed_kmh * 60.0)
-        .withColumn("altitude", F.coalesce(F.col("baro_altitude"), F.lit(0.0)))
+        .withColumn("altitude", altitude)
         .withColumn("velocity", velocity)
         .withColumn("vertical_rate", F.coalesce(F.col("vertical_rate"), F.lit(0.0)))
         .withColumn("hour_utc", F.hour(ts).cast("double"))

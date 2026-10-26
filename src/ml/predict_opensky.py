@@ -109,6 +109,8 @@ def run(
             config.arrival_airport,
             max_km,
             max_angle,
+            hub_elev_m=float(hub["elev_m"] or 0.0),
+            hub_dh_m=float(hub["decision_height_m"]),
         )
         # Also keep a count of how many states were inbound vs raw.
         n_raw = raw.count()

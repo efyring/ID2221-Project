@@ -65,9 +65,12 @@ TRAIN: historical flights (arrival airport + landing time) → train.py → mode
   * `baro_altitude`, `velocity`, `vertical_rate` (double; nulls filled with 0)
   * `actual_arrival_ts` (long): Actual landing timestamp
   * `on_ground` (boolean): Optional; grounded rows are dropped.
-* **Airports CSV**: Located at `AIRPORTS_PATH` with header `icao,lat,lon`. (Departure airport is not needed).
+* **Airports CSV**: `AIRPORTS_PATH` with header `icao,lat,lon[,elev_m][,decision_height_m]`.
+  * `decision_height_m` is absolute barometric altitude (metres MSL). Default = field elevation + ~200 ft AGL (CAT I).
+  * A flight is **landed** when `baro_altitude ≤ decision_height_m` near that airport.
+  * It is still **approaching** while AGL ≤ ~2000 ft above field elevation (and above decision height).
 * **Label & Features**: 
-  * Label: `remaining_min = (actual_arrival_ts - ts) / 60`
+  * Label: `remaining_min = (actual_arrival_ts - ts) / 60` until decision-height crossing
   * Features: Distance to arrival airport, naive ETA (distance / speed), altitude, speed, vertical rate, UTC hour, weekday.
 
 ---

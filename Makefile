@@ -54,6 +54,7 @@ train-live: ## train GBT on local labelled seed (synthetic or enriched), save un
 	AIRPORTS_PATH=./data/airports.csv \
 	MODEL_OUTPUT_PATH=./models/live/eta_gbt_pipeline \
 	SPARK_MASTER=local[*] \
+	DEFAULT_FS=file:/// \
 	python src/ml/train.py
 	@mkdir -p models/synthetic && rm -rf models/synthetic/eta_gbt_pipeline && cp -R models/live/eta_gbt_pipeline models/synthetic/eta_gbt_pipeline
 

@@ -1,0 +1,19 @@
+TRAIN_DATA_PATH=./data/synthetic/historical_opensky \
+	AIRPORTS_PATH=./data/airports.csv \
+	MODEL_OUTPUT_PATH=./models/live/eta_gbt_pipeline \
+	SPARK_MASTER=local[*] \
+	DEFAULT_FS=file:/// \
+	python src/ml/train.py
+26/10/26 14:28:45 WARN Utils: Your hostname, Juozass-MacBook-Pro.local resolves to a loopback address: 127.0.0.1; using 130.229.143.194 instead (on interface en0)
+26/10/26 14:28:45 WARN Utils: Set SPARK_LOCAL_IP if you need to bind to another address
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/10/26 14:28:46 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+26/10/26 14:28:46 WARN Utils: Service 'SparkUI' could not bind on port 4040. Attempting port 4041.
+[Stage 4:===============================================>           (4 + 1) / 5]                                                                                INFO:__main__:Fitting on 554847 rows
+[Stage 10:==============================================>           (4 + 1) / 5]                                                                                [Stage 13:==============================================>           (4 + 1) / 5]                                                                                26/10/26 14:29:30 WARN InstanceBuilder: Failed to load implementation from:dev.ludovic.netlib.blas.JNIBLAS
+26/10/26 14:29:30 WARN InstanceBuilder: Failed to load implementation from:dev.ludovic.netlib.blas.VectorBLAS
+INFO:__main__:Test RMSE: model 8.53 min | baseline (distance/speed) 23.87 min
+INFO:__main__:Test MAE: model 5.66 min | baseline (distance/speed) 17.48 min
+INFO:__main__:Saved model to ./models/live/eta_gbt_pipeline
+INFO:py4j.clientserver:Closing down clientserver connection
