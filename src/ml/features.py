@@ -47,8 +47,12 @@ FEATURE_COLS = [
 
 
 def load_airports(spark: SparkSession, path: str) -> DataFrame:
-    """Read the airport lookup CSV (columns: icao, lat, lon)."""
-    return spark.read.csv(path, header=True, inferSchema=True).select("icao", "lat", "lon")
+    """Read the airport lookup CSV (columns: icao, lat, lon[, elev_m])."""
+    raw = spark.read.csv(path, header=True, inferSchema=True)
+    cols = ["icao", "lat", "lon"]
+    if "elev_m" in raw.columns:
+        cols.append("elev_m")
+    return raw.select(*cols)
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):

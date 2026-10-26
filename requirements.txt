@@ -4,3 +4,6 @@ pyspark==3.5.3
 numpy
 pandas
 pyarrow
+streamlit
+plotly
+cassandra-driver

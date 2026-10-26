@@ -1,10 +1,10 @@
-"""Real-time ETA: Kafka -> keep flights inbound to the hub -> model -> landing time."""
+"""Real-time ETA: Kafka -> inbound European hubs -> model -> Cassandra / parquet."""
 
 import logging
 import os
 
 from pyspark.ml import PipelineModel
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
 from ml.features import OPENSKY_SCHEMA, _haversine_km, load_airports
@@ -22,17 +22,10 @@ def _bearing_deg(lat1, lon1, lat2, lon2):
     return F.pmod(F.degrees(F.atan2(x, y)) + 360.0, F.lit(360.0))
 
 
-def inbound_condition(hub_lat: float, hub_lon: float, max_km: float, max_angle: float):
-    """Column expression for "probably landing at the hub". Live states carry no
-    destination, so this is a heuristic:
-
-    * airborne, has a position, flying at airliner speed (>= 55 m/s), and either
-    * 60 km to max_km away and heading toward the hub (within max_angle degrees), or
-    * within 60 km, low (< 5000 m) and not climbing. Heading is ignored this close
-      because it is too noisy; this drops departures and overflights.
-    """
-    dist = _haversine_km(F.col("latitude"), F.col("longitude"), F.lit(hub_lat), F.lit(hub_lon))
-    brg = _bearing_deg(F.col("latitude"), F.col("longitude"), F.lit(hub_lat), F.lit(hub_lon))
+def inbound_condition(hub_lat, hub_lon, max_km: float, max_angle: float):
+    """Column expression for "probably landing at this hub" (lat/lon may be literals or columns)."""
+    dist = _haversine_km(F.col("latitude"), F.col("longitude"), hub_lat, hub_lon)
+    brg = _bearing_deg(F.col("latitude"), F.col("longitude"), hub_lat, hub_lon)
     off = F.abs(F.pmod(F.col("true_track") - brg + 540.0, F.lit(360.0)) - 180.0)
     airborne = ~F.coalesce(F.col("on_ground"), F.lit(False))
     has_pos = F.col("latitude").isNotNull() & F.col("longitude").isNotNull()
@@ -43,18 +36,22 @@ def inbound_condition(hub_lat: float, hub_lon: float, max_km: float, max_angle: 
         & (F.coalesce(F.col("baro_altitude"), F.lit(0.0)) < 5000.0)
         & (F.coalesce(F.col("vertical_rate"), F.lit(0.0)) <= 0.5)
     )
-    return airborne & has_pos & fast_enough & (heading_in | low_and_close)
+    return airborne & has_pos & fast_enough & (heading_in | low_and_close), dist
 
 
 CASSANDRA_COLUMNS = [
     "arr_airport", "icao24", "callsign", "ts",
+    "latitude", "longitude", "true_track",
     "dist_to_arr_km", "altitude", "velocity", "vertical_rate",
     "pred_remaining_min", "pred_landing_ts", "pred_landing_time",
 ]
 
 
 def write_cassandra(batch_df: DataFrame, keyspace: str) -> None:
-    """Upsert into flights.eta_latest (one row per aircraft) and append to eta_history."""
+    """Upsert into flights.eta_latest and append to eta_history."""
+    for col in CASSANDRA_COLUMNS:
+        if col not in batch_df.columns:
+            batch_df = batch_df.withColumn(col, F.lit(None))
     out = batch_df.select(*CASSANDRA_COLUMNS)
     for table in ("eta_latest", "eta_history"):
         (
@@ -65,21 +62,72 @@ def write_cassandra(batch_df: DataFrame, keyspace: str) -> None:
         )
 
 
-def live_predictions(parsed: DataFrame, model: PipelineModel, airports: DataFrame,
-                     hub_lat: float, hub_lon: float, arr_airport: str,
-                     max_km: float, max_angle: float) -> DataFrame:
-    """Works on batch and streaming DataFrames with OPENSKY_SCHEMA columns."""
+def european_hubs(airports: DataFrame) -> DataFrame:
+    """Hubs to score against. Override with ARRIVAL_AIRPORTS=EDDF,EHAM,LFPG,..."""
+    raw = os.getenv("ARRIVAL_AIRPORTS", "").strip()
+    hubs = airports.select(
+        F.col("icao").alias("hub_icao"),
+        F.col("lat").alias("hub_lat"),
+        F.col("lon").alias("hub_lon"),
+    )
+    if raw:
+        codes = [c.strip().upper() for c in raw.split(",") if c.strip()]
+        return hubs.filter(F.col("hub_icao").isin(codes))
+    # Default: European ICAO regions in our airports file (exclude US K***).
+    return hubs.filter(~F.col("hub_icao").startswith("K"))
+
+
+def live_predictions(
+    parsed: DataFrame,
+    model: PipelineModel,
+    airports: DataFrame,
+    hub_lat: float,
+    hub_lon: float,
+    arr_airport: str,
+    max_km: float,
+    max_angle: float,
+) -> DataFrame:
+    """Single-hub path (kept for predict_opensky / demos)."""
+    cond, _ = inbound_condition(F.lit(hub_lat), F.lit(hub_lon), max_km, max_angle)
     inbound = (
-        parsed.filter(inbound_condition(hub_lat, hub_lon, max_km, max_angle))
+        parsed.filter(cond)
         .withColumn("arr_airport", F.lit(arr_airport))
         .withColumn("ts", F.col("fetched_at"))
-        .withColumn("callsign", F.trim(F.col("callsign")))  # OpenSky pads callsigns
+        .withColumn("callsign", F.trim(F.col("callsign")))
+    )
+    return predict(model, inbound, airports)
+
+
+def live_predictions_multi(
+    parsed: DataFrame,
+    model: PipelineModel,
+    airports: DataFrame,
+    hubs: DataFrame,
+    max_km: float,
+    max_angle: float,
+) -> DataFrame:
+    """Assign each state to the closest European hub it is inbound toward."""
+    paired = parsed.crossJoin(F.broadcast(hubs))
+    cond, dist = inbound_condition(F.col("hub_lat"), F.col("hub_lon"), max_km, max_angle)
+    inbound = (
+        paired.filter(cond)
+        .withColumn("_dist_hub", dist)
+        .withColumn(
+            "_rn",
+            F.row_number().over(
+                Window.partitionBy("icao24").orderBy(F.col("_dist_hub").asc())
+            ),
+        )
+        .filter(F.col("_rn") == 1)
+        .withColumn("arr_airport", F.col("hub_icao"))
+        .withColumn("ts", F.col("fetched_at"))
+        .withColumn("callsign", F.trim(F.col("callsign")))
+        .drop("hub_icao", "hub_lat", "hub_lon", "_dist_hub", "_rn")
     )
     return predict(model, inbound, airports)
 
 
 def check_cassandra(spark, keyspace: str) -> None:
-    """Fail fast with a readable message if the keyspace/tables are missing."""
     for table in ("eta_latest", "eta_history"):
         try:
             spark.read.format("org.apache.spark.sql.cassandra").options(
@@ -89,34 +137,46 @@ def check_cassandra(spark, keyspace: str) -> None:
             first_line = str(exc).strip().splitlines()[0]
             raise SystemExit(
                 f"Cassandra table {keyspace}.{table} is not usable: {first_line}\n"
-                "Run `make cassandra` and check `docker compose logs cassandra-init`."
+                "Run `make cassandra`."
             ) from exc
 
 
-def make_batch_handler(model, airports, hub_lat, hub_lon, config, max_km, max_angle, out_path):
+def make_batch_handler(model, airports, hubs, config, max_km, max_angle, out_path):
     use_cassandra = config.cassandra_host is not None
+    multi = hubs.count() > 1
 
     def handle(raw_batch: DataFrame, batch_id: int) -> None:
         if raw_batch.isEmpty():
             return
         raw_batch = raw_batch.persist()
-        preds = live_predictions(
-            raw_batch, model, airports, hub_lat, hub_lon, config.arrival_airport, max_km, max_angle
-        ).persist()  # reused below; avoid re-running the model
+        if multi:
+            preds = live_predictions_multi(
+                raw_batch, model, airports, hubs, max_km, max_angle
+            ).persist()
+        else:
+            hub = hubs.first()
+            preds = live_predictions(
+                raw_batch, model, airports,
+                float(hub["hub_lat"]), float(hub["hub_lon"]), hub["hub_icao"],
+                max_km, max_angle,
+            ).persist()
         try:
             n_raw, n_inbound = raw_batch.count(), preds.count()
             if n_inbound == 0:
                 LOGGER.info("Batch %s: %d states received, none inbound", batch_id, n_raw)
                 return
-            farthest = preds.agg(F.max("dist_to_arr_km")).first()[0]
+            by_hub = {
+                r["arr_airport"]: r["count"]
+                for r in preds.groupBy("arr_airport").count().collect()
+            }
             LOGGER.info(
-                "Batch %s: %d states received, %d inbound (farthest %.0f km from %s)",
-                batch_id, n_raw, n_inbound, farthest, config.arrival_airport,
+                "Batch %s: %d states → %d inbound %s",
+                batch_id, n_raw, n_inbound, by_hub,
             )
             preds.orderBy("pred_remaining_min").show(25, truncate=False)
             if use_cassandra:
                 write_cassandra(preds, config.cassandra_keyspace)
-                LOGGER.info("Batch %s written to Cassandra keyspace %s", batch_id, config.cassandra_keyspace)
+                LOGGER.info("Batch %s → Cassandra.%s", batch_id, config.cassandra_keyspace)
             if out_path:
                 preds.write.mode("append").parquet(out_path)
         finally:
@@ -135,9 +195,13 @@ def main() -> None:
     )
 
     airports = load_airports(spark, config.airports_path)
-    hub = airports.filter(F.col("icao") == config.arrival_airport).first()
-    if hub is None:
-        raise SystemExit(f"{config.arrival_airport} not found in {config.airports_path}")
+    hubs = european_hubs(airports).cache()
+    n_hubs = hubs.count()
+    if n_hubs == 0:
+        raise SystemExit("No arrival hubs configured — check AIRPORTS_PATH / ARRIVAL_AIRPORTS")
+    LOGGER.info("Scoring inbound traffic to %d hubs", n_hubs)
+    hubs.show(50, truncate=False)
+
     model = PipelineModel.load(config.model_output_path)
     if use_cassandra:
         check_cassandra(spark, config.cassandra_keyspace)
@@ -155,13 +219,16 @@ def main() -> None:
         .filter(F.col("icao24").isNotNull())
     )
     handler = make_batch_handler(
-        model, airports, hub["lat"], hub["lon"], config,
+        model, airports, hubs, config,
         max_km=float(os.getenv("LIVE_MAX_KM", "1500")),
         max_angle=float(os.getenv("LIVE_MAX_ANGLE", "60")),
-        out_path=os.getenv("PREDICTIONS_PATH"),
+        out_path=os.getenv("PREDICTIONS_PATH", "./data/live/stream_predictions"),
     )
     query = (
         parsed.writeStream.foreachBatch(handler)
+        .option("checkpointLocation", os.getenv(
+            "STREAM_CHECKPOINT_PATH", "./data/checkpoints/eta_stream"
+        ))
         .trigger(processingTime=f"{os.getenv('TRIGGER_SECONDS', '15')} seconds")
         .start()
     )

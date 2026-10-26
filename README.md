@@ -18,6 +18,7 @@ make demo # Runs: make data, make train, make predict
 * **`make train`**: Fits the GBT model on the synthetic folder, saves it to `models/eta_gbt_pipeline`, and logs test RMSE/MAE against a naive distance/speed baseline.
 * **`make predict`**: Predicts landing times for `data/synthetic/current_flights`, printing `err_min` per flight and overall MAE.
 * **`make stream`**: Real-time prediction from Kafka.
+* **`make viz`**: Streamlit dashboard — inbound map, arrival board, model vs naive ETA, and error charts (uses synthetic predictions from `make demo`).
 
 > **Note:** Synthetic data lives in `data/synthetic/` (wiped and rewritten on each `make data`), keeping it separate from real ingested data in `data/historical_opensky/`. Replace with real history once available.
 
@@ -71,6 +72,32 @@ TRAIN: historical flights (arrival airport + landing time) → train.py → mode
 
 ---
 
+## Full live pipeline (OpenSky → Kafka → Spark → Cassandra → UI)
+
+Requires Docker, Java 17+, and Python deps (`pip install -r requirements.txt`).
+
+```bash
+make pipeline          # train seed → Docker stack → Cassandra → HDFS dirs → train model
+# then (keep running):
+make producer          # Terminal 1: OpenSky HTTP → Kafka
+make stream-live       # Terminal 2: Kafka → inbound EU hubs → GBT → parquet
+make sync-cassandra    # push latest parquet → Cassandra (re-run periodically)
+make viz-cassandra     # Terminal 3: Streamlit search UI
+```
+
+UI: filter by arrival airport (EDDF, EHAM, LFPG, …) and search callsign / icao24.  
+Note: a given aircraft only appears while the inbound heuristic classifies it toward a hub.
+
+## Streamlit Visualization (offline / synthetic)
+
+```bash
+make demo && make viz   # http://localhost:8501
+```
+
+Or one-shot live HTTP poll without Kafka: `make viz-live`.
+
+---
+
 ## Real-Time Predictions & Cassandra Storage
 
 ### Running the Stream
@@ -120,3 +147,4 @@ docker compose exec cassandra cqlsh -e "SELECT icao24, callsign, pred_remaining_
 * `src/ml/predict.py`: Batch inference and evaluation utilities.
 * `src/ml/predict_stream.py`: Real-time Kafka consumer → inbound filter → prediction stream.
 * `src/data/generate_synthetic.py`: Synthetic history and live data generator for testing.
+* `src/viz/app.py`: Streamlit visualization of predicted remaining time / landing times.

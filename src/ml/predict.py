@@ -34,11 +34,14 @@ def predict(model: PipelineModel, df: DataFrame, airports: DataFrame) -> DataFra
     )
     cols = [
         "icao24", "arr_airport", "ts",
-        "dist_to_arr_km", "altitude", "velocity", "vertical_rate",
+        "latitude", "longitude",
+        "dist_to_arr_km", "naive_eta_min", "altitude", "velocity", "vertical_rate",
         "pred_remaining_min", "pred_landing_ts", "pred_landing_time", "pred_landing_local",
     ]
     if "callsign" in scored.columns:  # live OpenSky states have it
         cols.insert(1, "callsign")
+    if "true_track" in scored.columns:  # ground track heading, degrees clockwise from north
+        cols.insert(cols.index("longitude") + 1, "true_track")
     if "true_arrival_ts" in scored.columns:  # only present in the synthetic demo data
         scored = scored.withColumn(
             "err_min", (F.col("pred_landing_ts") - F.col("true_arrival_ts")) / 60.0

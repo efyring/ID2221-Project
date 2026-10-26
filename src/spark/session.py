@@ -14,24 +14,22 @@ def create_spark_session(
 ) -> SparkSession:
     """Build a SparkSession from centralized env config."""
     cfg = config or SparkConfig.from_env()
-    builder = SparkSession.builder.appName(app_name)
-    
-    # Safely fetch session configs supporting both kafka and cassandra flags
+    builder = SparkSession.builder.appName(app_name).master(cfg.master)
+
     try:
         session_dict = cfg.session_configs(
             enable_kafka=enable_kafka, enable_cassandra=enable_cassandra
         )
     except TypeError:
         session_dict = cfg.session_configs(enable_kafka=enable_kafka)
-        
-    session_dict.pop("spark.jars.ivy", None)  # Remove Docker container path
-    
+
+    # Prefer explicit IVY_HOME (Docker sets this); fall back to a local cache on the host.
+    ivy = os.environ.get("IVY_HOME") or os.path.abspath("./.ivy2")
+    session_dict["spark.jars.ivy"] = ivy
+
     for key, value in session_dict.items():
         builder = builder.config(key, value)
-        
-    # Force Ivy cache to a local, writable folder on your Mac
-    builder = builder.config("spark.jars.ivy", os.path.abspath("./.ivy2"))
-    
+
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel(cfg.log_level)
     return spark
