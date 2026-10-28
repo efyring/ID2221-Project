@@ -10,7 +10,7 @@ from pyspark.ml import PipelineModel
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
-from ml.airport_alt import APPROACH_AGL_M, DEFAULT_DECISION_HEIGHT_AGL_M
+from ml.airport_alt import DEFAULT_DECISION_HEIGHT_AGL_M, NEAR_HUB_AGL_M
 from ml.features import OPENSKY_SCHEMA, _haversine_km, load_airports
 from ml.predict import predict
 from ml.train import offline_config
@@ -48,10 +48,10 @@ def inbound_condition(
     landed = (baro <= dh) & (dist <= 40.0)
     fast_enough = F.coalesce(F.col("velocity"), F.lit(0.0)) >= 55.0
     heading_in = (dist > 60.0) & (dist <= max_km) & (off <= max_angle)
-    # Still approaching while AGL ≤ 2000 ft (and still above decision height).
+    # Close to the hub, low and not climbing => inbound
     approaching = (
         (dist <= 60.0)
-        & (agl <= APPROACH_AGL_M)
+        & (agl <= NEAR_HUB_AGL_M)
         & (baro > dh)
         & (F.coalesce(F.col("vertical_rate"), F.lit(0.0)) <= 0.5)
     )
@@ -60,6 +60,44 @@ def inbound_condition(
         & (fast_enough | approaching),
         dist,
     )
+
+
+def sticky_condition(hub_lat, hub_lon, max_km: float, hub_dh_m):
+    """Keep a flight's earlier hub while it is plausibly still going there: inside the
+    terminal area, or pointing roughly at the hub. Released once it is flying away from it."""
+    dist = _haversine_km(F.col("latitude"), F.col("longitude"), hub_lat, hub_lon)
+    brg = _bearing_deg(F.col("latitude"), F.col("longitude"), hub_lat, hub_lon)
+    off = F.abs(F.pmod(F.col("true_track") - brg + 540.0, F.lit(360.0)) - 180.0)
+    airborne = ~F.coalesce(F.col("on_ground"), F.lit(False))
+    has_pos = F.col("latitude").isNotNull() & F.col("longitude").isNotNull()
+    landed = (F.coalesce(F.col("baro_altitude"), F.lit(0.0)) <= hub_dh_m) & (dist <= 40.0)
+    return airborne & has_pos & ~landed & (dist <= max_km) & ((dist <= 150.0) | (off <= 90.0)), dist
+
+
+class HubAssignments:
+    """Remembers which hub each aircraft was last assigned to, so the target does not
+    flip between airports from one batch to the next."""
+
+    MAX_AGE_S = 30 * 60
+
+    def __init__(self) -> None:
+        self._by_icao: dict[str, tuple[str, int]] = {}
+
+    def as_df(self, spark) -> DataFrame:
+        return spark.createDataFrame(
+            [(k, v[0]) for k, v in self._by_icao.items()],
+            "icao24 string, sticky_airport string",
+        )
+
+    def update(self, preds: DataFrame) -> None:
+        rows = preds.select("icao24", "arr_airport", "ts").collect()
+        for r in rows:
+            self._by_icao[r["icao24"]] = (r["arr_airport"], int(r["ts"]))
+        if rows:
+            newest = max(int(r["ts"]) for r in rows)
+            self._by_icao = {
+                k: v for k, v in self._by_icao.items() if newest - v[1] <= self.MAX_AGE_S
+            }
 
 
 CASSANDRA_COLUMNS = [
@@ -98,8 +136,10 @@ def european_hubs(airports: DataFrame) -> DataFrame:
     if raw:
         codes = [c.strip().upper() for c in raw.split(",") if c.strip()]
         return hubs.filter(F.col("hub_icao").isin(codes))
-    # Default: European ICAO regions in our airports file (exclude US K***).
-    return hubs.filter(~F.col("hub_icao").startswith("K"))
+    # Default: airports inside a Europe box (the file may also hold US/Gulf airports).
+    return hubs.filter(
+        F.col("hub_lat").between(34.0, 72.0) & F.col("hub_lon").between(-25.0, 45.0)
+    )
 
 
 def live_predictions(
@@ -136,27 +176,43 @@ def live_predictions_multi(
     hubs: DataFrame,
     max_km: float,
     max_angle: float,
+    sticky: Optional[DataFrame] = None,
 ) -> DataFrame:
-    """Assign each state to the closest European hub it is inbound toward."""
+    """Assign each aircraft to one hub and score it.
+
+    ``sticky`` (icao24, sticky_airport) holds earlier assignments. If an aircraft's
+    earlier hub still looks plausible it keeps it; otherwise it goes to the closest
+    hub it is inbound toward.
+    """
     paired = parsed.crossJoin(F.broadcast(hubs))
     cond, dist = inbound_condition(
         F.col("hub_lat"), F.col("hub_lon"), max_km, max_angle,
         hub_elev_m=F.col("hub_elev_m"), hub_dh_m=F.col("hub_dh_m"),
     )
+    candidates = paired.filter(cond).withColumn("_dist_hub", dist).withColumn("_prio", F.lit(1))
+    if sticky is not None:
+        kept = (
+            parsed.join(F.broadcast(sticky), "icao24")
+            .join(F.broadcast(hubs), F.col("sticky_airport") == F.col("hub_icao"))
+            .drop("sticky_airport")
+        )
+        keep_cond, keep_dist = sticky_condition(
+            F.col("hub_lat"), F.col("hub_lon"), max_km, F.col("hub_dh_m")
+        )
+        kept = kept.filter(keep_cond).withColumn("_dist_hub", keep_dist).withColumn("_prio", F.lit(0))
+        candidates = candidates.unionByName(kept)
     inbound = (
-        paired.filter(cond)
-        .withColumn("_dist_hub", dist)
-        .withColumn(
+        candidates.withColumn(
             "_rn",
             F.row_number().over(
-                Window.partitionBy("icao24").orderBy(F.col("_dist_hub").asc())
+                Window.partitionBy("icao24").orderBy(F.col("_prio").asc(), F.col("_dist_hub").asc())
             ),
         )
         .filter(F.col("_rn") == 1)
         .withColumn("arr_airport", F.col("hub_icao"))
         .withColumn("ts", F.col("fetched_at"))
         .withColumn("callsign", F.trim(F.col("callsign")))
-        .drop("hub_icao", "hub_lat", "hub_lon", "hub_elev_m", "hub_dh_m", "_dist_hub", "_rn")
+        .drop("hub_icao", "hub_lat", "hub_lon", "hub_elev_m", "hub_dh_m", "_dist_hub", "_prio", "_rn")
     )
     return predict(model, inbound, airports)
 
@@ -193,6 +249,7 @@ def make_batch_handler(model, airports, hubs, config, max_km, max_angle, out_pat
         config.cassandra_host is not None and not use_cassandra_spark
     )
     multi = hubs.count() > 1
+    assignments = HubAssignments()
 
     def handle(raw_batch: DataFrame, batch_id: int) -> None:
         if raw_batch.isEmpty():
@@ -207,7 +264,8 @@ def make_batch_handler(model, airports, hubs, config, max_km, max_angle, out_pat
         )
         if multi:
             preds = live_predictions_multi(
-                raw_batch, model, airports, hubs, max_km, max_angle
+                raw_batch, model, airports, hubs, max_km, max_angle,
+                sticky=assignments.as_df(raw_batch.sparkSession),
             ).persist()
         else:
             hub = hubs.first()
@@ -220,6 +278,8 @@ def make_batch_handler(model, airports, hubs, config, max_km, max_angle, out_pat
             ).persist()
         try:
             n_raw, n_inbound = raw_batch.count(), preds.count()
+            if multi:
+                assignments.update(preds)
             if n_inbound == 0:
                 LOGGER.info("Batch %s: %d states received, none inbound", batch_id, n_raw)
                 return

@@ -68,7 +68,12 @@ def _approach_assignments(states: DataFrame, airports: DataFrame) -> DataFrame:
         F.coalesce(F.col("elev_m"), F.lit(0.0)).alias("_apt_elev_m"),
         F.col("decision_height_m").alias("_apt_dh_m"),
     )
-    paired = states.crossJoin(F.broadcast(apt)).withColumn(
+    # Cheap prefilter before cross join with every airport: approach rows are low and descending, which is a small fraction of all states
+    candidates = states.filter(
+        F.coalesce(F.col("gradually_descending"), F.lit(False))
+        & (F.col("baro_altitude") <= 5000.0)
+    )
+    paired = candidates.crossJoin(F.broadcast(apt)).withColumn(
         "_dist_km",
         _haversine_km(F.col("latitude"), F.col("longitude"), F.col("_apt_lat"), F.col("_apt_lon")),
     ).withColumn(

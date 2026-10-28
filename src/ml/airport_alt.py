@@ -8,6 +8,9 @@ FT_TO_M = 0.3048
 APPROACH_AGL_FT = 2000.0
 APPROACH_AGL_M = APPROACH_AGL_FT * FT_TO_M
 
+# Within ~60 km of a hub, a flight that is below this height above the field and not climbing is treated as inbound to it
+NEAR_HUB_AGL_M = 5000.0
+
 # Default CAT I decision height above the runway (AGL). Landing = reaching
 # decision_height_m MSL = elev_m + this AGL (or an explicit CSV override).
 DEFAULT_DECISION_HEIGHT_AGL_FT = 200.0
