@@ -1,6 +1,7 @@
 kafka-python
 requests
 pyspark==3.5.3
+setuptools  # restores distutils for PySpark on Python 3.12+
 numpy
 pandas
 pyarrow

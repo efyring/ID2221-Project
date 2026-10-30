@@ -6,12 +6,9 @@ import os
 from typing import Any
 
 import pandas as pd
-from pyspark.ml import PipelineModel
 
-from ml.features import load_airports
-from ml.predict import predict
-from ml.train import offline_config
-from spark.session import create_spark_session
+# Spark is imported inside ``run_predictions`` so Cassandra-only Streamlit
+# (``make viz-cassandra``) can load without pulling PySpark at import time.
 
 
 def run_predictions(
@@ -24,6 +21,13 @@ def run_predictions(
     Adds ``delay_vs_naive_min``: model remaining time minus the naive distance/speed
     ETA (positive ⇒ model expects a longer trip than kinematics alone).
     """
+    from pyspark.ml import PipelineModel
+
+    from ml.features import load_airports
+    from ml.predict import predict
+    from ml.train import offline_config
+    from spark.session import create_spark_session
+
     config = offline_config()
     input_path = input_path or os.environ.get(
         "PREDICT_INPUT_PATH", "./data/synthetic/current_flights"
