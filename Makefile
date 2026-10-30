@@ -12,7 +12,7 @@ export VIZ_CACHE_PATH ?= ./data/synthetic/predictions.parquet
 	stack-up seed-hdfs train-live producer stream-live pipeline viz-cassandra clean
 
 data:      ## generate synthetic flights + airports under ./data/synthetic
-	python src/data/generate_synthetic.py
+	python src/gen_data/generate_synthetic.py
 
 train:     ## fit the model on TRAIN_DATA_PATH
 	python src/ml/train.py
