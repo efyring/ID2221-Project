@@ -1,155 +1,83 @@
-# ID2221-Project
+# ID2221 — Flight ETA Prediction Engine
 
-Kafka + Spark stack for OpenSky aircraft states, combined with a Gradient Boosted Trees (GBT) model that predicts remaining flight time and landing times at an airport (default: Frankfurt, **EDDF**; change via `ARRIVAL_AIRPORT`).
+Gradient Boosted Trees model that predicts remaining flight time and landing time for inbound aircraft (default hub: Frankfurt **EDDF**).
 
----
+## Prerequisites
 
-## Quick Start
-
-### 1. Try End-to-End on Synthetic Data (No Docker Needed)
-Requires Java 17/21 and Python:
+- **Java 17+** (required by PySpark)
+- **Python 3.9+** (3.12 needs `setuptools` from `requirements.txt` for PySpark)
+- **Docker** (only for the live Kafka / Cassandra pipeline)
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-make demo # Runs: make data, make train, make predict
 ```
 
-* **`make data`**: Writes synthetic history (`data/synthetic/historical_opensky/`, ~3,000 flights, 500k snapshots) and current flight snapshots (`data/synthetic/current_flights/`, 200 unseen mid-flight snapshots).
-* **`make train`**: Fits the GBT model on the synthetic folder, saves it to `models/eta_gbt_pipeline`, and logs test RMSE/MAE against a naive distance/speed baseline.
-* **`make predict`**: Predicts landing times for `data/synthetic/current_flights`, printing `err_min` per flight and overall MAE.
-* **`make stream`**: Real-time prediction from Kafka.
-* **`make viz`**: Streamlit dashboard — inbound map, arrival board, model vs naive ETA, and error charts (uses synthetic predictions from `make demo`).
-
-> **Note:** Synthetic data lives in `data/synthetic/` (wiped and rewritten on each `make data`), keeping it separate from real ingested data in `data/historical_opensky/`. Replace with real history once available.
-
-### 2. Live Docker Stack
-1. Start infrastructure and ingest stream:
-   ```bash
-   docker compose up -d --build
-   ```
-2. On the host, install producer dependencies and publish states:
-   ```bash
-   python -m pip install -r requirements.txt
-   python src/producer/producer.py
-   ```
-3. **Monitor**:
-   * Spark Master UI: [http://localhost:8080](http://localhost:8080)
-   * Ingested Parquet data: `./data/historical_opensky/fetched_at_date=YYYY-MM-DD/`
-
----
-
-## Architecture & Data Flow
-
-| Component | Where it runs | Role |
-|-----------|---------------|------|
-| `kafka` / `kafka-init` | Docker | Message broker & topic initializer (`opensky-states`) |
-| `spark-master` / `spark-worker` | Docker | Distributed compute cluster (`7077` / UI `8080`) |
-| `ingest` | Docker | `src/spark/ingest.py` — Kafka → Parquet storage & periodic model training |
-| `producer.py` | Host | Polls OpenSky HTTP API → Kafka |
-| `predict_stream.py` | Host/Local | Real-time Kafka consumer → inbound filter → ETA predictions |
-
-```text
-LIVE: OpenSky API → producer (host) → Kafka → predict_stream.py → predicted landing times
-TRAIN: historical flights (arrival airport + landing time) → train.py → model
-```
-
----
-
-## Data Requirements
-
-* **Training Data**: Parquet at `TRAIN_DATA_PATH`, one row per position snapshot:
-  * `icao24` (string): Aircraft ID
-  * `arr_airport` (string): ICAO code of landing airport
-  * `ts` (long): Snapshot time, Unix seconds UTC
-  * `latitude`, `longitude` (double)
-  * `baro_altitude`, `velocity`, `vertical_rate` (double; nulls filled with 0)
-  * `actual_arrival_ts` (long): Actual landing timestamp
-  * `on_ground` (boolean): Optional; grounded rows are dropped.
-* **Airports CSV**: `AIRPORTS_PATH` with header `icao,lat,lon[,elev_m][,decision_height_m]`.
-  * `decision_height_m` is absolute barometric altitude (metres MSL). Default = field elevation + ~200 ft AGL (CAT I).
-  * A flight is **landed** when `baro_altitude ≤ decision_height_m` near that airport.
-  * It is still **approaching** while AGL ≤ ~2000 ft above field elevation (and above decision height).
-* **Label & Features**: 
-  * Label: `remaining_min = (actual_arrival_ts - ts) / 60` until decision-height crossing
-  * Features: Distance to arrival airport, naive ETA (distance / speed), altitude, speed, vertical rate, UTC hour, weekday.
-
----
-
-## Full live pipeline (OpenSky → Kafka → Spark → Cassandra → UI)
-
-Requires Docker, Java 17+, and Python deps (`pip install -r requirements.txt`).
+On macOS with Homebrew OpenJDK, point Spark at Java 17 if `java` is not already on your `PATH`:
 
 ```bash
-make pipeline          # train seed → Docker stack → Cassandra → HDFS dirs → train model
-# then (keep running):
-make producer          # Terminal 1: OpenSky → Kafka every 60s
-make stream-live       # Terminal 2: Kafka → rescore inbound EU flights every 60s → Cassandra
-make viz-cassandra     # Terminal 3: Streamlit (auto-refresh ~60s)
+export JAVA_HOME="$(/usr/libexec/java_home -v 17 2>/dev/null || echo /opt/homebrew/opt/openjdk@17)"
+export PATH="$JAVA_HOME/bin:$PATH"
 ```
 
-Each minute the stream takes the latest OpenSky state per airborne aircraft from Kafka,
-re-runs the GBT, and upserts `flights.eta_latest` / appends `eta_history` so ETAs track
-live position, speed, and altitude until the flight leaves the inbound set.
+## Run (offline demo)
 
-UI: filter by arrival airport (EDDF, EHAM, LFPG, …) and search callsign / icao24.
-
-## Streamlit Visualization (offline / synthetic)
+No Docker needed. From the repo root with the venv active:
 
 ```bash
-make demo && make viz   # http://localhost:8501
+make demo   # generate synthetic data → train → predict
 ```
 
-Or one-shot live HTTP poll without Kafka: `make viz-live`.
+This:
 
----
+1. Writes synthetic history and mid-flight snapshots under `data/synthetic/`
+2. Trains the GBT model to `models/synthetic/eta_gbt_pipeline`
+3. Prints predicted landing times and `err_min` / MAE for the current-flight set
 
-## Real-Time Predictions & Cassandra Storage
+Useful individual steps:
 
-### Running the Stream
-Start Kafka and the producer, then run the streaming predictor:
+| Command | What it does |
+|---------|----------------|
+| `make data` | Regenerate synthetic training + current flights |
+| `make train` | Fit the model |
+| `make predict` | Score `data/synthetic/current_flights` |
+
+## Interact
+
+### Streamlit dashboard (synthetic)
+
+After `make demo`:
+
 ```bash
-python src/producer/producer.py # Terminal 1
-make stream                     # Terminal 2: predictions every 15s
+make viz
 ```
 
-### Storing Predictions in Cassandra
+Open [http://localhost:8501](http://localhost:8501) for the inbound map, arrival board, and model vs naive ETA charts.
+
+One-shot live OpenSky poll (no Kafka): `make viz-live`.
+
+### Live pipeline (OpenSky → Kafka → Cassandra → UI)
+
+Requires Docker. Bring the stack up once:
+
 ```bash
-make cassandra                   # Starts Cassandra, creates keyspace & tables
-python src/producer/producer.py  # Terminal 1
-CASSANDRA_HOST=localhost make stream # Terminal 2: predicts and writes every micro-batch
+make pipeline   # synthetic seed → Docker (Kafka/HDFS/Spark/Cassandra) → train live model
 ```
-* **`flights.eta_latest`**: Newest prediction per aircraft (`arr_airport`, `icao24`), expiring after 1 h without refresh.
-* **`flights.eta_history`**: Every prediction per aircraft (`icao24`, `ts DESC`), kept for 7 days.
 
-Query latest arrivals via cqlsh:
+Then in three terminals:
+
 ```bash
-docker compose exec cassandra cqlsh -e "SELECT icao24, callsign, pred_remaining_min, pred_landing_time FROM flights.eta_latest WHERE arr_airport='EDDF';"
+make producer        # OpenSky → Kafka every 60s
+make stream-live     # Kafka → ETA every 60s → Cassandra
+make viz-cassandra   # Streamlit reading live predictions
 ```
 
----
+UI: filter by arrival airport and search by callsign / icao24.
 
-## Configuration
+Optional: query latest ETAs in Cassandra:
 
-| Variable | Cluster Default | Local Default | Description |
-|----------|-----------------|---------------|-------------|
-| `SPARK_MASTER` | `spark://spark-master:7077` | `local[*]` | Spark master URL |
-| `TRAIN_DATA_PATH` | `hdfs://namenode:8020/data/historical_opensky` | `./data/historical_opensky` | Parquet historical data path |
-| `AIRPORTS_PATH` | `hdfs://namenode:8020/data/airports.csv` | `./data/airports.csv` | Airports CSV file path |
-| `MODEL_OUTPUT_PATH` | `hdfs://namenode:8020/models/eta_gbt_pipeline` | `./models/eta_gbt_pipeline` | Model output directory |
-| `ARRIVAL_AIRPORT` | `EDDF` | `EDDF` | Target destination hub ICAO code |
-| `KAFKA_BOOTSTRAP_SERVERS` | `kafka:29092` | `localhost:9092` | Kafka bootstrap servers |
-| `CASSANDRA_HOST` | `unset` (off) | `localhost` (to enable) | Cassandra host for sink |
-| `DISPLAY_TZ` | `Europe/Berlin` | `Europe/Berlin` | Local wall-clock timezone for arrivals |
-
----
-
-## Codebase Layout
-
-* `src/producer/producer.py`: Polls OpenSky Network API → Kafka.
-* `src/spark/{config,session,ingest,aggregate}.py`: Spark configuration, session, and streaming ingestion.
-* `src/ml/features.py`: Schema, features, and label extraction.
-* `src/ml/train.py`: Model training, evaluation, and saving.
-* `src/ml/predict.py`: Batch inference and evaluation utilities.
-* `src/ml/predict_stream.py`: Real-time Kafka consumer → inbound filter → prediction stream.
-* `src/data/generate_synthetic.py`: Synthetic history and live data generator for testing.
-* `src/viz/app.py`: Streamlit visualization of predicted remaining time / landing times.
+```bash
+docker compose exec cassandra cqlsh -e \
+  "SELECT icao24, callsign, pred_remaining_min, pred_landing_time FROM flights.eta_latest WHERE arr_airport='EDDF';"
+```
